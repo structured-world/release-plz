@@ -211,9 +211,7 @@ fn update_workspace_changelog(
     };
 
     const HEADER: &str = "# Changelog\n\n";
-    let body = existing
-        .strip_prefix(HEADER)
-        .unwrap_or(existing.as_str());
+    let body = existing.strip_prefix(HEADER).unwrap_or(existing.as_str());
 
     // Separate from previous entry with a horizontal rule.
     let separator = if body.trim().is_empty() {

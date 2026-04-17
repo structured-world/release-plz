@@ -615,6 +615,7 @@ mod tests {
         Config {
             changelog: ChangelogCfg::default(),
             workspace: Workspace {
+                workspace_changelog: None,
                 dependencies_update: Some(false),
                 changelog_config: Some("../git-cliff.toml".into()),
                 allow_dirty: Some(false),
@@ -738,6 +739,7 @@ mod tests {
         let config = Config {
             changelog: ChangelogCfg::default(),
             workspace: Workspace {
+                workspace_changelog: None,
                 dependencies_update: None,
                 changelog_config: Some("../git-cliff.toml".into()),
                 allow_dirty: None,
