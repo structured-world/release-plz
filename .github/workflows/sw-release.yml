@@ -54,6 +54,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
+        shell: bash
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -62,12 +63,14 @@ jobs:
           rustup default stable
 
       - name: Build
+        shell: bash
         env:
           TARGET: ${{ matrix.target }}
         run: cargo build --release --bin release-plz --target "$TARGET"
 
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
+        shell: bash
         env:
           TARGET: ${{ matrix.target }}
         run: |
