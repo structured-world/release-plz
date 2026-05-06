@@ -14,6 +14,9 @@ concurrency:
 jobs:
   build-and-push:
     name: Build and Push Docker Image
+    permissions:
+      contents: read
+      packages: write # required: push image to GHCR
     strategy:
       matrix:
         include:
@@ -22,7 +25,6 @@ jobs:
           - os: ubuntu-24.04-arm
             platform: linux/arm64
     runs-on: ${{ matrix.os }}
-    environment: dockerhub
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -36,46 +38,27 @@ jobs:
         id: meta
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
         with:
-          images: marcoieni/release-plz
+          images: ghcr.io/${{ github.repository }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
             type=sha
             type=raw,value=latest
             type=match,pattern=release-plz-v(\d+),group=1
             type=match,pattern=release-plz-v(\d+.\d+),group=1
-            type=match,pattern=release-plz-v(\d+.\d+.\d+),group=1
+            type=match,pattern=release-plz-v(.+),group=1
 
-      - name: Cache Docker layers
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-buildx-
-          lookup-only: true
-
-      - name: Login to DockerHub
-        if: github.event_name != 'pull_request'
+      - name: Login to GHCR
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           platforms: ${{ matrix.platform }}
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
-
-      # Temp fix
-      # https://github.com/docker/build-push-action/issues/252
-      # https://github.com/moby/buildkit/issues/1896
-      - name: Move cache
-        run: |
-          rm -rf /tmp/.buildx-cache
-          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
