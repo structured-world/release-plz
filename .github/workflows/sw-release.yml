@@ -1,0 +1,113 @@
+# structured-world release-plz fork — build prebuilt binaries
+#
+# Trigger: tag push matching `release-plz-v*-sw.*` (e.g. release-plz-v0.3.157-sw.1)
+# Matrix: linux x86_64, linux aarch64, macOS universal, windows x86_64
+# Output: release on GitHub with tarballs matching upstream naming convention,
+# so downstream consumers can swap upstream URL → fork URL with no other changes.
+#
+# Naming: `release-plz-<target>.tar.gz` (linux/macOS) / `.zip` (windows).
+# Same as upstream → drop-in replacement.
+
+name: Build SW release-plz binaries
+
+on:
+  push:
+    tags:
+      - 'release-plz-v*-sw.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. release-plz-v0.3.157-sw.1)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --bin release-plz --target ${{ matrix.target }}
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf ../../../release-plz-${{ matrix.target }}.tar.gz release-plz
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          Compress-Archive -Path release-plz.exe -DestinationPath ../../../release-plz-${{ matrix.target }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-plz-${{ matrix.target }}
+          path: release-plz-${{ matrix.target }}.${{ matrix.archive }}
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          body: |
+            structured-world fork of release-plz with the following pending upstream PRs applied:
+
+            - release-plz/release-plz#2801 — workspace_changelog aggregated changelog
+            - release-plz/release-plz#2800 — opt out of cascade version bumps for private packages
+            - release-plz/release-plz#2789 — git_only fall back to source dir compare
+
+            Drop-in replacement for upstream binaries — same naming convention.
+          files: artifacts/release-plz-*.{tar.gz,zip}
+          prerelease: false

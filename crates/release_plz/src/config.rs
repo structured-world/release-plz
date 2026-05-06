@@ -61,6 +61,10 @@ impl Config {
         }
         let mut update_request =
             update_request.with_default_package_config(default_update_config.into());
+        if let Some(ref path) = self.workspace.workspace_changelog {
+            let path = to_utf8_pathbuf(path.clone())?;
+            update_request = update_request.with_workspace_changelog(path);
+        }
         for (package, config) in self.packages() {
             let mut update_config = config.clone();
             update_config = update_config.merge(self.workspace.packages_defaults.clone());
@@ -215,6 +219,12 @@ pub struct Workspace {
     #[serde(default = "default_max_analyze_commits")]
     #[schemars(default = "default_max_analyze_commits")]
     pub max_analyze_commits: Option<u32>,
+    /// # Workspace Changelog
+    /// Path to the aggregated workspace-wide changelog file, relative to the workspace root.
+    /// When set, instead of writing per-crate CHANGELOG.md files, all package changes are
+    /// collected into a single file grouped by package name.
+    /// Example: `workspace_changelog = "CHANGELOG.md"`
+    pub workspace_changelog: Option<PathBuf>,
 }
 
 impl Default for Workspace {
@@ -234,6 +244,7 @@ impl Default for Workspace {
             release_commits: None,
             release_always: None,
             max_analyze_commits: default_max_analyze_commits(),
+            workspace_changelog: None,
         }
     }
 }
@@ -464,6 +475,18 @@ pub struct PackageConfig {
     /// Custom regex to match commit types that should trigger a major version increment.
     /// Useful when using non-conventional commit prefixes.
     pub custom_major_increment_regex: Option<String>,
+    /// # Dependent Update
+    /// Whether to bump this package when one of its workspace dependencies changes.
+    ///
+    /// - `true`: always cascade-bump (the legacy behaviour for all packages).
+    /// - `false`: never cascade-bump (opt out explicitly).
+    /// - Unset (default): auto — cascade-bump iff the package is publishable
+    ///   (i.e. `publish` is not `false`/`[]` in Cargo.toml). `publish = false`
+    ///   crates have no downstream consumers, so cascade bumps produce only
+    ///   noise in the release PR and changelog.
+    ///
+    /// See <https://github.com/release-plz/release-plz/issues/2799>.
+    pub dependent_update: Option<bool>,
 }
 
 impl From<PackageConfig> for release_plz_core::UpdateConfig {
@@ -479,6 +502,7 @@ impl From<PackageConfig> for release_plz_core::UpdateConfig {
             custom_minor_increment_regex: config.custom_minor_increment_regex,
             custom_major_increment_regex: config.custom_major_increment_regex,
             git_only: config.git_only,
+            dependent_update: config.dependent_update,
         }
     }
 }
@@ -525,6 +549,7 @@ impl PackageConfig {
                 .custom_major_increment_regex
                 .or(default.custom_major_increment_regex),
             git_only: self.git_only.or(default.git_only),
+            dependent_update: self.dependent_update.or(default.dependent_update),
         }
     }
 
@@ -590,6 +615,7 @@ mod tests {
         Config {
             changelog: ChangelogCfg::default(),
             workspace: Workspace {
+                workspace_changelog: None,
                 dependencies_update: Some(false),
                 changelog_config: Some("../git-cliff.toml".into()),
                 allow_dirty: Some(false),
@@ -713,6 +739,7 @@ mod tests {
         let config = Config {
             changelog: ChangelogCfg::default(),
             workspace: Workspace {
+                workspace_changelog: None,
                 dependencies_update: None,
                 changelog_config: Some("../git-cliff.toml".into()),
                 allow_dirty: None,
