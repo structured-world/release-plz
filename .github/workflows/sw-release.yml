@@ -1,0 +1,143 @@
+# structured-world release-plz fork — build prebuilt binaries
+#
+# Trigger: tag push matching `release-plz-v*-sw.*` (e.g. release-plz-v0.3.157-sw.1)
+# Matrix: linux x86_64, linux aarch64, macOS universal, windows x86_64
+# Output: release on GitHub with tarballs matching upstream naming convention,
+# so downstream consumers can swap upstream URL → fork URL with no other changes.
+#
+# Naming: `release-plz-<target>.tar.gz` (linux/macOS) / `.zip` (windows).
+# Same as upstream → drop-in replacement.
+
+name: Build SW release-plz binaries
+
+on:
+  push:
+    tags:
+      - 'release-plz-v*-sw.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. release-plz-v0.3.157-sw.1)'
+        required: true
+
+permissions: {}
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    # Read-only — checkout source, no write access required for build.
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add "$TARGET"
+          rustup default stable
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --bin release-plz --target "$TARGET"
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cd "target/${TARGET}/release"
+          tar -czf "../../../release-plz-${TARGET}.tar.gz" release-plz
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cd "target/$env:TARGET/release"
+          Compress-Archive -Path release-plz.exe -DestinationPath "../../../release-plz-$env:TARGET.zip"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-plz-${{ matrix.target }}
+          path: release-plz-${{ matrix.target }}.${{ matrix.archive }}
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # required: create/update the GitHub Release and upload artifacts via gh CLI
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Resolve tag
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "tag=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create / update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          NOTES=$(cat <<'EOF'
+          structured-world fork of release-plz with the following pending upstream PRs applied:
+
+          - release-plz/release-plz#2801 — workspace_changelog aggregated changelog
+          - release-plz/release-plz#2800 — opt out of cascade version bumps for private packages
+          - release-plz/release-plz#2789 — git_only fall back to source dir compare
+
+          Drop-in replacement for upstream binaries — same naming convention.
+          EOF
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/release-plz-*.tar.gz artifacts/release-plz-*.zip --clobber
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes "$NOTES" \
+              artifacts/release-plz-*.tar.gz artifacts/release-plz-*.zip
+          fi
