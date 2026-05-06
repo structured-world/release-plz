@@ -182,6 +182,7 @@ fn apply_defaults_to_git_config(git_config: GitConfig, pr_link: Option<&str>) ->
         exclude_paths: git_config.exclude_paths,
         include_paths: git_config.include_paths,
         fail_on_unmatched_commit: git_config.fail_on_unmatched_commit,
+        processing_order: git_config.processing_order,
     }
 }
 
