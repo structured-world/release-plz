@@ -54,10 +54,12 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add "$TARGET"
+          rustup default stable
 
       - name: Build
         env:
@@ -90,9 +92,8 @@ jobs:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
-    # Required to create/update the GitHub Release and upload artifacts via gh CLI.
     permissions:
-      contents: write
+      contents: write # required: create/update the GitHub Release and upload artifacts via gh CLI
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
