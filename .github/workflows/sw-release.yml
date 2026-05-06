@@ -26,6 +26,7 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    # Read-only — checkout source, no write access required for build.
     permissions:
       contents: read
     strategy:
@@ -59,20 +60,26 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --bin release-plz --target ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --bin release-plz --target "$TARGET"
 
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          cd target/${{ matrix.target }}/release
-          tar -czf ../../../release-plz-${{ matrix.target }}.tar.gz release-plz
+          cd "target/${TARGET}/release"
+          tar -czf "../../../release-plz-${TARGET}.tar.gz" release-plz
 
       - name: Package (zip)
         if: matrix.archive == 'zip'
         shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          cd target/${{ matrix.target }}/release
-          Compress-Archive -Path release-plz.exe -DestinationPath ../../../release-plz-${{ matrix.target }}.zip
+          cd "target/$env:TARGET/release"
+          Compress-Archive -Path release-plz.exe -DestinationPath "../../../release-plz-$env:TARGET.zip"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -83,6 +90,7 @@ jobs:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    # Required to create/update the GitHub Release and upload artifacts via gh CLI.
     permissions:
       contents: write
     steps:
@@ -97,25 +105,38 @@ jobs:
 
       - name: Resolve tag
         id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "tag=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create / update GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
-        with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: ${{ steps.tag.outputs.tag }}
-          body: |
-            structured-world fork of release-plz with the following pending upstream PRs applied:
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          NOTES=$(cat <<'EOF'
+          structured-world fork of release-plz with the following pending upstream PRs applied:
 
-            - release-plz/release-plz#2801 — workspace_changelog aggregated changelog
-            - release-plz/release-plz#2800 — opt out of cascade version bumps for private packages
-            - release-plz/release-plz#2789 — git_only fall back to source dir compare
+          - release-plz/release-plz#2801 — workspace_changelog aggregated changelog
+          - release-plz/release-plz#2800 — opt out of cascade version bumps for private packages
+          - release-plz/release-plz#2789 — git_only fall back to source dir compare
 
-            Drop-in replacement for upstream binaries — same naming convention.
-          files: artifacts/release-plz-*.{tar.gz,zip}
-          prerelease: false
+          Drop-in replacement for upstream binaries — same naming convention.
+          EOF
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/release-plz-*.tar.gz artifacts/release-plz-*.zip --clobber
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes "$NOTES" \
+              artifacts/release-plz-*.tar.gz artifacts/release-plz-*.zip
+          fi
