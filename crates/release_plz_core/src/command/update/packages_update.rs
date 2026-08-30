@@ -40,7 +40,15 @@ fn release_notes(update: &UpdateResult, package_name: &str) -> (Option<String>, 
             warn!("can't determine changes in changelog of package {package_name}: {e:?}");
             from_entry
         }
-        Ok(Some(c)) => (Some(c.title().to_string()), Some(c.notes().to_string())),
+        // Only when that section is THIS release. A package updated because a
+        // dependency moved keeps its previous changelog in memory, so the top
+        // section there names the version before this one; reporting it would
+        // put the last release's notes under the new version. The entry
+        // computed for this release is the truthful answer in that case.
+        Ok(Some(c)) if c.title().contains(&update.version.to_string()) => {
+            (Some(c.title().to_string()), Some(c.notes().to_string()))
+        }
+        Ok(Some(_)) => from_entry,
         Ok(None) => {
             warn!("no changes detected in changelog of package {package_name}");
             from_entry
@@ -206,16 +214,47 @@ mod release_notes_tests {
         assert_eq!(notes, None, "no notes for a blank entry");
     }
 
-    /// A package that did change is described by its changelog, as before.
+    /// A package updated because a dependency moved carries a real entry for
+    /// this release, but its in-memory changelog still starts at the PREVIOUS
+    /// version. The notes must come from the entry, not from that section: this
+    /// is how the server crate ended up showing 0.5.2 inside the 0.5.3 release.
     #[test]
-    fn a_package_with_a_new_entry_is_described() {
+    fn a_stale_top_section_does_not_describe_this_release() {
         let (title, notes) = release_notes(
             &update(Some("### Fixed\n\n- the thing this release fixes\n")),
             "coordinode-server",
         );
-        assert!(title.is_some(), "a changed package keeps its title");
+        assert_eq!(
+            title, None,
+            "a section for an older version must not title this release",
+        );
+        let notes = notes.expect("the entry computed for this release describes it");
         assert!(
-            notes.is_some_and(|n| !n.trim().is_empty()),
+            notes.contains("the thing this release fixes"),
+            "notes must come from this release's entry, got: {notes}",
+        );
+        assert!(
+            !notes.contains("shipped last time"),
+            "the previous release's notes must not appear, got: {notes}",
+        );
+    }
+
+    /// A package that did change is described by its changelog, as before.
+    #[test]
+    fn a_package_with_a_new_entry_is_described() {
+        let mut u = update(Some("### Fixed\n\n- the thing this release fixes\n"));
+        // Its changelog was regenerated, so the top section IS this release.
+        u.changelog = Some(
+            "# Changelog\n\n## [0.5.3](https://example.com/compare/v0.5.2...v0.5.3) - 2026-08-30\n\n### Fixed\n\n- the thing this release fixes\n"
+                .to_string(),
+        );
+        let (title, notes) = release_notes(&u, "coordinode-server");
+        assert!(
+            title.is_some_and(|t| t.contains("0.5.3")),
+            "a changed package is titled with the version being released",
+        );
+        assert!(
+            notes.is_some_and(|n| n.contains("the thing this release fixes")),
             "a changed package keeps its notes",
         );
     }
