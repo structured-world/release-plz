@@ -143,6 +143,47 @@ fn update_changelogs(
     Ok(())
 }
 
+/// Render one workspace-changelog entry from the per-package entries.
+///
+/// Each package entry arrives with its own `## [x.y.z] - date` heading, which
+/// sits a level *above* the `### <package>` heading it is nested under. Left
+/// alone it closes the package section the moment it appears, so every package
+/// after the first renders outside the package it belongs to, and the version
+/// is stated twice. The version moves onto the package heading instead, and the
+/// sections below it are demoted to keep the hierarchy.
+fn render_workspace_entry(
+    pkg_entries: &[(String, String, cargo_metadata::semver::Version)],
+    version: &cargo_metadata::semver::Version,
+    date: &str,
+) -> String {
+    let mut out = format!("## v{version} - {date}\n\n");
+
+    for (pkg_name, entry, pkg_version) in pkg_entries {
+        out.push_str(&format!("### {pkg_name} {pkg_version}\n\n"));
+        let mut wrote_line = false;
+        for line in entry.lines() {
+            if line.starts_with("## ") {
+                continue;
+            }
+            // Skip the blank line the dropped heading left behind.
+            if !wrote_line && line.trim().is_empty() {
+                continue;
+            }
+            wrote_line = true;
+            // Demote package-level heading sections: ### Foo → #### Foo
+            if let Some(rest) = line.strip_prefix("### ") {
+                out.push_str(&format!("#### {rest}\n"));
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out.push('\n');
+    }
+
+    out
+}
+
 fn update_workspace_changelog(
     update_request: &UpdateRequest,
     local_packages: &PackagesUpdate,
@@ -180,22 +221,8 @@ fn update_workspace_changelog(
         .cloned()
         .unwrap_or_else(|| cargo_metadata::semver::Version::new(0, 0, 0));
 
-    let date = Utc::now().format("%Y-%m-%d");
-    let mut new_entry = format!("## v{version} — {date}\n\n");
-
-    for (pkg_name, entry, _) in &pkg_entries {
-        new_entry.push_str(&format!("### {pkg_name}\n"));
-        // Demote package-level heading sections: ### Foo → #### Foo
-        for line in entry.lines() {
-            if let Some(rest) = line.strip_prefix("### ") {
-                new_entry.push_str(&format!("#### {rest}\n"));
-            } else {
-                new_entry.push_str(line);
-                new_entry.push('\n');
-            }
-        }
-        new_entry.push('\n');
-    }
+    let date = Utc::now().format("%Y-%m-%d").to_string();
+    let new_entry = render_workspace_entry(&pkg_entries, &version, &date);
 
     // Resolve path relative to workspace root (parent of local_manifest).
     let abs_path = update_request
@@ -316,4 +343,59 @@ fn update_dependencies(
         local_manifest.write()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod workspace_changelog_tests {
+    use super::render_workspace_entry;
+    use cargo_metadata::semver::Version;
+
+    fn entry(pkg: &str, body: &str) -> (String, String, Version) {
+        (pkg.to_string(), body.to_string(), Version::new(0, 5, 2))
+    }
+
+    /// A package entry opens with its own `## [x.y.z]` heading. Emitted as-is
+    /// under `### <package>` it closes that section immediately, so every
+    /// package after the first renders outside the package it documents.
+    #[test]
+    fn package_sections_stay_nested() {
+        let rendered = render_workspace_entry(
+            &[
+                entry(
+                    "coordinode-raft",
+                    "## [0.5.2] - 2026-08-29\n\n### Fixed\n\n- *(raft)* a fix\n",
+                ),
+                entry(
+                    "coordinode-storage",
+                    "## [0.5.2] - 2026-08-29\n\n### Fixed\n\n- *(storage)* another fix\n",
+                ),
+            ],
+            &Version::new(0, 5, 2),
+            "2026-08-29",
+        );
+
+        // Exactly one top-level heading: the release itself.
+        let top_level: Vec<&str> = rendered
+            .lines()
+            .filter(|l| l.starts_with("## ") && !l.starts_with("### "))
+            .collect();
+        assert_eq!(top_level, vec!["## v0.5.2 - 2026-08-29"], "{rendered}");
+
+        // The version survives on the package heading rather than being lost.
+        assert!(rendered.contains("### coordinode-raft 0.5.2"), "{rendered}");
+        assert!(
+            rendered.contains("### coordinode-storage 0.5.2"),
+            "{rendered}"
+        );
+
+        // Sections sit one level below their package.
+        assert_eq!(rendered.matches("#### Fixed").count(), 2, "{rendered}");
+
+        // Each fix is filed under its own package.
+        let raft = rendered.find("### coordinode-raft").unwrap();
+        let storage = rendered.find("### coordinode-storage").unwrap();
+        let raft_fix = rendered.find("- *(raft)* a fix").unwrap();
+        assert!(raft < raft_fix && raft_fix < storage, "{rendered}");
+        assert!(storage < rendered.find("- *(storage)* another fix").unwrap());
+    }
 }
