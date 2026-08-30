@@ -24,7 +24,14 @@ pub struct PackagesUpdate {
 /// reporting it here would present already-released work as part of this
 /// release.
 fn release_notes(update: &UpdateResult, package_name: &str) -> (Option<String>, Option<String>) {
-    if update.new_changelog_entry.is_none() {
+    // Absent OR blank: a package carried along by a dependency bump gets an
+    // entry that is present but empty, which is the same "nothing happened
+    // here" the aggregate changelog filters out.
+    let has_entry = update
+        .new_changelog_entry
+        .as_ref()
+        .is_some_and(|e| !e.trim().is_empty());
+    if !has_entry {
         return (None, None);
     }
     let from_entry = (None, update.new_changelog_entry.clone());
@@ -186,6 +193,17 @@ mod release_notes_tests {
         let (title, notes) = release_notes(&update(None), "coordinode-core");
         assert_eq!(title, None, "no title for a package with no changes");
         assert_eq!(notes, None, "no notes for a package with no changes");
+    }
+
+    /// A package bumped only by a dependency gets an entry that exists but is
+    /// blank. It is the same "nothing happened here" as no entry at all, and it
+    /// is the shape that actually occurs: every unchanged crate in a workspace
+    /// release arrives this way.
+    #[test]
+    fn a_package_with_a_blank_entry_contributes_no_notes() {
+        let (title, notes) = release_notes(&update(Some("\n  \n")), "coordinode-core");
+        assert_eq!(title, None, "no title for a blank entry");
+        assert_eq!(notes, None, "no notes for a blank entry");
     }
 
     /// A package that did change is described by its changelog, as before.
