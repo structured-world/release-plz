@@ -22,7 +22,7 @@ use cargo_metadata::{
     semver::Version,
 };
 use chrono::NaiveDate;
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::path::PathBuf;
 use std::sync::Arc;
 use toml_edit::TableLike;
@@ -86,6 +86,44 @@ fn get_temp_worktree_and_repo(
     Ok((repo, worktree))
 }
 
+/// Paths of the submodules checked out in the working copy containing `manifest_dir`,
+/// relative to its root.
+fn checked_out_submodules(manifest_dir: &Utf8Path) -> anyhow::Result<BTreeSet<String>> {
+    let root = root_repo_path_from_manifest_dir(manifest_dir)?;
+    // `foreach` visits only the submodules that are checked out.
+    let paths = git_cmd::git_in_dir(&root, &["submodule", "foreach", "--quiet", "echo $sm_path"])
+        .context("list the submodules of the working copy")?;
+    Ok(paths.lines().map(str::to_owned).collect())
+}
+
+/// Check out in `worktree` the submodules of `checked_out` that it records, at the
+/// commits it records: path dependencies and package files can live in them, and
+/// the released package has to be read as the working copy reads the current one.
+fn init_submodules(worktree: &Utf8Path, checked_out: &BTreeSet<String>) -> anyhow::Result<()> {
+    if checked_out.is_empty() {
+        return Ok(());
+    }
+    // Submodules can be added or removed after a release.
+    let index = git_cmd::git_in_dir(worktree, &["ls-files", "--stage", "-z"])
+        .context("list the gitlinks of the release")?;
+    let gitlinks = index.split_terminator('\0').filter_map(|entry| {
+        let (metadata, path) = entry.split_once('\t')?;
+        (metadata.starts_with("160000 ") && checked_out.contains(path)).then_some(path)
+    });
+    let mut args = vec!["submodule", "update", "--init", "--recursive", "--"];
+    let options = args.len();
+    args.extend(gitlinks);
+    if args.len() == options {
+        return Ok(());
+    }
+    debug!(
+        "checking out submodules {:?} of the release",
+        &args[options..]
+    );
+    git_cmd::git_in_dir(worktree, &args).context("check out the submodules of the release")?;
+    Ok(())
+}
+
 struct ReconstructedWorkspace {
     /// Kept alive because the metadata paths point into the worktree, which is
     /// cleaned up on drop.
@@ -127,6 +165,7 @@ fn process_git_only_package(
     input: &UpdateRequest,
     is_multi_package: bool,
     reconstructed_workspaces: &mut BTreeMap<String, ReconstructedWorkspace>,
+    checked_out_submodules: &BTreeSet<String>,
 ) -> anyhow::Result<Option<RegistryPackage>> {
     // Get the release tag template, falling back to default based on project structure
     let template = input
@@ -177,6 +216,7 @@ fn process_git_only_package(
 
             repo.checkout_commit(&release_commit)
                 .context("checkout release commit for package")?;
+            init_submodules(to_utf8_path(worktree.path())?, checked_out_submodules)?;
 
             // Keep the original manifests and path dependencies. Creating archives would
             // require registry versions even for dependencies that will never be published.
@@ -301,12 +341,12 @@ fn collect_git_only_packages(
     // reconstruction inputs (repository, manifest, Cargo config) are fixed for this invocation.
     let mut reconstructed_workspaces = BTreeMap::new();
 
-    let mut unreleased_project_repo = GitRepo::open(
-        input
-            .local_manifest_dir()
-            .context("get local manifest dir")?,
-    )
-    .context("create unreleased repo for spinning worktrees")?;
+    let local_manifest_dir = input
+        .local_manifest_dir()
+        .context("get local manifest dir")?;
+    let mut unreleased_project_repo = GitRepo::open(local_manifest_dir)
+        .context("create unreleased repo for spinning worktrees")?;
+    let checked_out_submodules = checked_out_submodules(local_manifest_dir)?;
 
     for package in git_only_packages {
         if let Some(registry_package) = process_git_only_package(
@@ -315,6 +355,7 @@ fn collect_git_only_packages(
             input,
             is_multi_package,
             &mut reconstructed_workspaces,
+            &checked_out_submodules,
         )? {
             all_packages.insert(registry_package.package.name.to_string(), registry_package);
         }

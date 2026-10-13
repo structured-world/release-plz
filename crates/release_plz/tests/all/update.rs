@@ -1022,6 +1022,66 @@ fn workspace_with_feat_release_commits_filter(packages: &[(&str, &str)]) -> (Utf
     )
 }
 
+/// A `git_only` package with a path dependency inside a submodule: the
+/// reconstructed release needs the submodule's files, as the working copy has
+/// them, to list the files of the released package.
+#[test]
+fn git_only_update_reconstructs_initialized_submodules() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let dep_dir = temp_dir.path().join("dep");
+    fs_err::create_dir_all(dep_dir.join("src")).unwrap();
+    fs_err::write(
+        dep_dir.join("Cargo.toml"),
+        "[package]\nname = \"dep\"\nversion = \"1.0.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs_err::write(dep_dir.join("src/lib.rs"), "pub fn dep() {}\n").unwrap();
+    Repo::init(&dep_dir);
+
+    let project_dir = temp_dir.path().join("project");
+    fs_err::create_dir_all(project_dir.join("src")).unwrap();
+    fs_err::write(
+        project_dir.join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n\
+         [dependencies]\ndep = { path = \"vendor/dep\" }\n",
+    )
+    .unwrap();
+    fs_err::write(project_dir.join("src/lib.rs"), "// Initial release\n").unwrap();
+    fs_err::write(
+        project_dir.join("release-plz.toml"),
+        "[workspace]\ngit_only = true\npublish = false\nsemver_check = false\n",
+    )
+    .unwrap();
+    let repo = Repo::init(&project_dir);
+    repo.git(&[
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        dep_dir.as_str(),
+        "vendor/dep",
+    ])
+    .unwrap();
+    generate_lockfile(&project_dir);
+    repo.add_all_and_commit("chore: vendor dep").unwrap();
+    repo.tag_lightweight("v0.1.0").unwrap();
+    fs_err::write(project_dir.join("src/lib.rs"), "// Fixed\n").unwrap();
+    repo.add_all_and_commit("fix: update app").unwrap();
+
+    release_plz_cmd(&temp_dir.path().join("target"))
+        .current_dir(&project_dir)
+        // The submodule's URL is a local path, which git refuses by default.
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "protocol.file.allow")
+        .env("GIT_CONFIG_VALUE_0", "always")
+        .arg("update")
+        .assert()
+        .success();
+
+    let manifest = fs_err::read_to_string(project_dir.join("Cargo.toml")).unwrap();
+    assert!(manifest.contains("version = \"0.1.1\""), "{manifest}");
+}
+
 /// Creates a workspace with [`init_workspace`] whose packages are already tagged
 /// as released at their current version, and whose `origin` remote is on GitHub.
 fn released_workspace(
