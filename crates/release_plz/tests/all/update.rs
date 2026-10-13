@@ -1028,49 +1028,350 @@ fn workspace_with_feat_release_commits_filter(packages: &[(&str, &str)]) -> (Utf
 #[test]
 fn git_only_update_reconstructs_initialized_submodules() {
     let temp_dir = Utf8TempDir::new().unwrap();
-    let dep_dir = temp_dir.path().join("dep");
-    fs_err::create_dir_all(dep_dir.join("src")).unwrap();
-    fs_err::write(
-        dep_dir.join("Cargo.toml"),
-        "[package]\nname = \"dep\"\nversion = \"1.0.0\"\nedition = \"2024\"\n",
-    )
-    .unwrap();
-    fs_err::write(dep_dir.join("src/lib.rs"), "pub fn dep() {}\n").unwrap();
-    Repo::init(&dep_dir);
+    let dep = crate_repo(&temp_dir.path().join("dep"), "dep", "");
+    let repo = git_only_app(temp_dir.path(), "dep = { path = \"vendor/dep\" }");
+    add_submodule(&repo, dep.directory(), "vendor/dep");
+    release_then_fix(&repo);
 
-    let project_dir = temp_dir.path().join("project");
-    fs_err::create_dir_all(project_dir.join("src")).unwrap();
-    fs_err::write(
-        project_dir.join("Cargo.toml"),
-        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n\
-         [dependencies]\ndep = { path = \"vendor/dep\" }\n",
+    assert_git_only_patch_release(&temp_dir, &repo);
+}
+
+/// A submodule path is used verbatim, so one with repeated spaces and glob
+/// characters is still checked out in the release.
+#[test]
+fn git_only_update_reconstructs_submodules_at_unusual_paths() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let dep = crate_repo(&temp_dir.path().join("dep"), "dep", "");
+    let repo = git_only_app(
+        temp_dir.path(),
+        "dep = { path = \"vendor/two  spaces[1]\" }",
+    );
+    add_submodule(&repo, dep.directory(), "vendor/two  spaces[1]");
+    release_then_fix(&repo);
+
+    assert_git_only_patch_release(&temp_dir, &repo);
+}
+
+/// The release's gitlink decides what is checked out, whatever update
+/// procedure the working copy configures for the submodule.
+#[test]
+fn git_only_update_reconstructs_submodules_whose_update_is_none() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let dep = crate_repo(&temp_dir.path().join("dep"), "dep", "");
+    let repo = git_only_app(temp_dir.path(), "dep = { path = \"vendor/dep\" }");
+    add_submodule(&repo, dep.directory(), "vendor/dep");
+    repo.git(&["config", "submodule.vendor/dep.update", "none"])
+        .unwrap();
+    release_then_fix(&repo);
+
+    assert_git_only_patch_release(&temp_dir, &repo);
+}
+
+/// A nested submodule the working copy leaves uninitialized is not fetched,
+/// so its repository being unreachable does not stop the update.
+#[test]
+fn git_only_update_skips_uninitialized_nested_submodules() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let inner_dir = temp_dir.path().join("inner");
+    crate_repo(&inner_dir, "inner", "");
+    let dep = crate_repo(&temp_dir.path().join("dep"), "dep", "");
+    add_submodule(&dep, &inner_dir, "inner");
+    dep.add_all_and_commit("add inner").unwrap();
+    let repo = git_only_app(temp_dir.path(), "dep = { path = \"vendor/dep\" }");
+    add_submodule(&repo, dep.directory(), "vendor/dep");
+    fs_err::remove_dir_all(&inner_dir).unwrap();
+    release_then_fix(&repo);
+
+    assert_git_only_patch_release(&temp_dir, &repo);
+}
+
+/// A nested submodule the working copy has checked out is checked out in the
+/// release too, as a dependency can live in it.
+#[test]
+fn git_only_update_reconstructs_initialized_nested_submodules() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let inner_dir = temp_dir.path().join("inner");
+    crate_repo(&inner_dir, "inner", "");
+    let dep = crate_repo(
+        &temp_dir.path().join("dep"),
+        "dep",
+        "[dependencies]\ninner = { path = \"inner\" }\n",
+    );
+    add_submodule(&dep, &inner_dir, "inner");
+    dep.add_all_and_commit("add inner").unwrap();
+    let repo = git_only_app(temp_dir.path(), "dep = { path = \"vendor/dep\" }");
+    add_submodule(&repo, dep.directory(), "vendor/dep");
+    repo.git(&[
+        ALLOW_FILE[0],
+        ALLOW_FILE[1],
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+    ])
+    .unwrap();
+    release_then_fix(&repo);
+
+    assert_git_only_patch_release(&temp_dir, &repo);
+}
+
+/// A submodule whose repository was replaced after the release is fetched
+/// from the repository the release records, which has the released commit.
+#[test]
+fn git_only_update_reconstructs_submodules_from_the_released_repository() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let old = crate_repo(&temp_dir.path().join("old"), "dep", "");
+    let repo = git_only_app(temp_dir.path(), "dep = { path = \"vendor/dep\" }");
+    add_submodule(&repo, old.directory(), "vendor/dep");
+    generate_lockfile(repo.directory());
+    repo.add_all_and_commit("chore: add dep").unwrap();
+    repo.tag_lightweight("v0.1.0").unwrap();
+
+    // An unrelated history: it lacks the released commit.
+    let new = crate_repo(&temp_dir.path().join("new"), "dep", "");
+    repo.git(&[
+        "submodule",
+        "set-url",
+        "vendor/dep",
+        new.directory().as_str(),
+    ])
+    .unwrap();
+    let submodule = repo.directory().join("vendor/dep");
+    git_cmd::git_in_dir(
+        &submodule,
+        &[
+            ALLOW_FILE[0],
+            ALLOW_FILE[1],
+            "fetch",
+            new.directory().as_str(),
+        ],
     )
     .unwrap();
-    fs_err::write(project_dir.join("src/lib.rs"), "// Initial release\n").unwrap();
+    git_cmd::git_in_dir(&submodule, &["checkout", "FETCH_HEAD"]).unwrap();
+    repo.add_all_and_commit("chore: replace dep repository")
+        .unwrap();
+    change_app(&repo);
+
+    assert_git_only_patch_release(&temp_dir, &repo);
+}
+
+/// A submodule moved after the release is the same submodule, under the
+/// same name: it is checked out at the path the release records.
+#[test]
+fn git_only_update_reconstructs_moved_submodules() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let dep = crate_repo(&temp_dir.path().join("dep"), "dep", "");
+    // `app` inherits the dependency, so moving it leaves `app`'s manifest as
+    // released and its files are compared with the release's.
+    let dir = temp_dir.path().join("project");
+    fs_err::create_dir_all(dir.join("app/src")).unwrap();
     fs_err::write(
-        project_dir.join("release-plz.toml"),
+        dir.join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n\
+         [dependencies]\ndep = { workspace = true }\n",
+    )
+    .unwrap();
+    fs_err::write(dir.join("app/src/lib.rs"), "// Initial release\n").unwrap();
+    let workspace = |path: &str| {
+        format!(
+            "[workspace]\nmembers = [\"app\"]\nexclude = [\"vendor\", \"third\"]\nresolver = \"3\"\n\n\
+             [workspace.dependencies]\ndep = {{ path = \"{path}\" }}\n"
+        )
+    };
+    fs_err::write(dir.join("Cargo.toml"), workspace("vendor/dep")).unwrap();
+    fs_err::write(
+        dir.join("release-plz.toml"),
         "[workspace]\ngit_only = true\npublish = false\nsemver_check = false\n",
     )
     .unwrap();
-    let repo = Repo::init(&project_dir);
-    repo.git(&[
-        "-c",
-        "protocol.file.allow=always",
-        "submodule",
-        "add",
-        dep_dir.as_str(),
-        "vendor/dep",
-    ])
-    .unwrap();
-    generate_lockfile(&project_dir);
-    repo.add_all_and_commit("chore: vendor dep").unwrap();
+    let repo = Repo::init(&dir);
+    add_submodule(&repo, dep.directory(), "vendor/dep");
+    generate_lockfile(&dir);
+    repo.add_all_and_commit("chore: add dep").unwrap();
     repo.tag_lightweight("v0.1.0").unwrap();
-    fs_err::write(project_dir.join("src/lib.rs"), "// Fixed\n").unwrap();
+
+    fs_err::create_dir(dir.join("third")).unwrap();
+    repo.git(&["mv", "vendor/dep", "third/dep"]).unwrap();
+    fs_err::write(dir.join("Cargo.toml"), workspace("third/dep")).unwrap();
+    repo.add_all_and_commit("chore: move dep").unwrap();
+    fs_err::write(dir.join("app/src/lib.rs"), "// Fixed\n").unwrap();
     repo.add_all_and_commit("fix: update app").unwrap();
 
+    assert_git_only_patch_release_of(&temp_dir, &repo, "app/Cargo.toml");
+}
+
+/// A submodule removed after the release is still checked out in the release,
+/// which can need it: here another workspace member depended on it.
+#[test]
+fn git_only_update_reconstructs_submodules_removed_since() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let dep = crate_repo(&temp_dir.path().join("dep"), "dep", "");
+    let dir = temp_dir.path().join("project");
+    for (member, dependencies) in [("app", ""), ("b", "dep = { path = \"../vendor/dep\" }")] {
+        fs_err::create_dir_all(dir.join(member).join("src")).unwrap();
+        fs_err::write(
+            dir.join(member).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+                 publish = false\n\n[dependencies]\n{dependencies}\n"
+            ),
+        )
+        .unwrap();
+        fs_err::write(dir.join(member).join("src/lib.rs"), "// Initial release\n").unwrap();
+    }
+    fs_err::write(
+        dir.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"b\"]\nexclude = [\"vendor\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    fs_err::write(
+        dir.join("release-plz.toml"),
+        "[workspace]\ngit_only = true\npublish = false\nsemver_check = false\n",
+    )
+    .unwrap();
+    let repo = Repo::init(&dir);
+    add_submodule(&repo, dep.directory(), "vendor/dep");
+    generate_lockfile(&dir);
+    repo.add_all_and_commit("chore: add dep").unwrap();
+    repo.tag_lightweight("app-v0.1.0").unwrap();
+    repo.tag_lightweight("b-v0.1.0").unwrap();
+
+    repo.git(&["rm", "vendor/dep"]).unwrap();
+    fs_err::write(
+        dir.join("b/Cargo.toml"),
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n",
+    )
+    .unwrap();
+    generate_lockfile(&dir);
+    repo.add_all_and_commit("fix: drop dep").unwrap();
+    // As in a fresh clone, which has no trace of the removed submodule.
+    repo.git(&["config", "--remove-section", "submodule.vendor/dep"])
+        .unwrap();
+    fs_err::remove_dir_all(dir.join(".git/modules/vendor")).unwrap();
+    fs_err::write(dir.join("app/src/lib.rs"), "// Fixed\n").unwrap();
+    repo.add_all_and_commit("fix: update app").unwrap();
+
+    assert_git_only_patch_release_of(&temp_dir, &repo, "app/Cargo.toml");
+}
+
+/// A submodule removed after the release that nothing needs can be
+/// unreachable: the update still succeeds.
+#[test]
+fn git_only_update_tolerates_unreachable_submodules_removed_since() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let extra_dir = temp_dir.path().join("extra");
+    crate_repo(&extra_dir, "extra", "");
+    let dir = temp_dir.path().join("project");
+    fs_err::create_dir_all(dir.join("app/src")).unwrap();
+    fs_err::write(
+        dir.join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n",
+    )
+    .unwrap();
+    fs_err::write(dir.join("app/src/lib.rs"), "// Initial release\n").unwrap();
+    fs_err::write(
+        dir.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\"]\nexclude = [\"extra\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    fs_err::write(
+        dir.join("release-plz.toml"),
+        "[workspace]\ngit_only = true\npublish = false\nsemver_check = false\n",
+    )
+    .unwrap();
+    let repo = Repo::init(&dir);
+    add_submodule(&repo, &extra_dir, "extra");
+    generate_lockfile(&dir);
+    repo.add_all_and_commit("chore: add extra").unwrap();
+    repo.tag_lightweight("v0.1.0").unwrap();
+    repo.git(&["rm", "extra"]).unwrap();
+    repo.add_all_and_commit("chore: remove extra").unwrap();
+    // As in a fresh clone, which has no trace of the removed submodule.
+    repo.git(&["config", "--remove-section", "submodule.extra"])
+        .unwrap();
+    fs_err::remove_dir_all(dir.join(".git/modules/extra")).unwrap();
+    fs_err::remove_dir_all(&extra_dir).unwrap();
+    fs_err::write(dir.join("app/src/lib.rs"), "// Fixed\n").unwrap();
+    repo.add_all_and_commit("fix: update app").unwrap();
+
+    assert_git_only_patch_release_of(&temp_dir, &repo, "app/Cargo.toml");
+}
+
+/// Git configuration for the submodules of these tests, whose URLs are local
+/// paths that git refuses to clone by default.
+const ALLOW_FILE: [&str; 2] = ["-c", "protocol.file.allow=always"];
+
+/// Crate `name` in its own repository at `dir`, with `manifest` appended to
+/// its `Cargo.toml`.
+fn crate_repo(dir: &Utf8Path, name: &str, manifest: &str) -> Repo {
+    fs_err::create_dir_all(dir.join("src")).unwrap();
+    fs_err::write(
+        dir.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"1.0.0\"\nedition = \"2024\"\n{manifest}"
+        ),
+    )
+    .unwrap();
+    fs_err::write(dir.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    Repo::init(dir)
+}
+
+/// A `git_only` project in `<parent>/project` whose package `app` has the
+/// given `dependencies`.
+fn git_only_app(parent: &Utf8Path, dependencies: &str) -> Repo {
+    let dir = parent.join("project");
+    fs_err::create_dir_all(dir.join("src")).unwrap();
+    fs_err::write(
+        dir.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n\
+             [dependencies]\n{dependencies}\n"
+        ),
+    )
+    .unwrap();
+    fs_err::write(dir.join("src/lib.rs"), "// Initial release\n").unwrap();
+    fs_err::write(
+        dir.join("release-plz.toml"),
+        "[workspace]\ngit_only = true\npublish = false\nsemver_check = false\n",
+    )
+    .unwrap();
+    Repo::init(&dir)
+}
+
+fn add_submodule(repo: &Repo, url: &Utf8Path, path: &str) {
+    repo.git(&[
+        ALLOW_FILE[0],
+        ALLOW_FILE[1],
+        "submodule",
+        "add",
+        url.as_str(),
+        path,
+    ])
+    .unwrap();
+}
+
+/// Tag the project as released at 0.1.0, then commit a fix to `app`.
+fn release_then_fix(repo: &Repo) {
+    generate_lockfile(repo.directory());
+    repo.add_all_and_commit("chore: add dependencies").unwrap();
+    repo.tag_lightweight("v0.1.0").unwrap();
+    change_app(repo);
+}
+
+fn change_app(repo: &Repo) {
+    fs_err::write(repo.directory().join("src/lib.rs"), "// Fixed\n").unwrap();
+    repo.add_all_and_commit("fix: update app").unwrap();
+}
+
+/// `release-plz update` bumps `app` to 0.1.1.
+fn assert_git_only_patch_release(temp_dir: &Utf8TempDir, repo: &Repo) {
+    assert_git_only_patch_release_of(temp_dir, repo, "Cargo.toml");
+}
+
+/// `release-plz update` bumps the package of `manifest` to 0.1.1.
+fn assert_git_only_patch_release_of(temp_dir: &Utf8TempDir, repo: &Repo, manifest: &str) {
     release_plz_cmd(&temp_dir.path().join("target"))
-        .current_dir(&project_dir)
-        // The submodule's URL is a local path, which git refuses by default.
+        .current_dir(repo.directory())
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "protocol.file.allow")
         .env("GIT_CONFIG_VALUE_0", "always")
@@ -1078,7 +1379,7 @@ fn git_only_update_reconstructs_initialized_submodules() {
         .assert()
         .success();
 
-    let manifest = fs_err::read_to_string(project_dir.join("Cargo.toml")).unwrap();
+    let manifest = fs_err::read_to_string(repo.directory().join(manifest)).unwrap();
     assert!(manifest.contains("version = \"0.1.1\""), "{manifest}");
 }
 
