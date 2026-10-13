@@ -48,9 +48,9 @@ struct Selected<'a> {
 ///
 /// Submodules are matched by name, so one moved since the release is found.
 /// Those checked out in the working copy are required, and fetched from that
-/// checkout first. Those the working copy no longer declares, or whose
-/// repository it replaced, are tried, as only the release knows whether it
-/// needs them: failing to fetch one only warns, since a release that needs it
+/// checkout first. Those the working copy no longer declares, or now fetches
+/// from another URL (from its checkout first, in case that is a mirror), are
+/// tried, as only the release knows whether it needs them: failing to fetch one only warns, since a release that needs it
 /// fails later with Cargo's error anyway. Those the working copy declares but
 /// leaves uninitialized stay so. Nested submodules follow the same rules
 /// against the working copy's checkout of the same repository. No git
@@ -113,9 +113,12 @@ fn check_out_level(release: &Utf8Path, working_copy: Option<&Utf8Path>) -> anyho
             let sources = vec![Source::WorkingCopy(checkout.clone()), remote];
             required.push(selected(sources, Some(checkout)));
         } else {
-            // The repository was replaced: the working copy's checkout is
-            // another repository.
-            optional.push(selected(vec![released_source()?], None));
+            // Another URL: a mirror of the same history, whose checkout can have
+            // the released commit, or a replacement. Having the commit does not
+            // tell them apart (a checkout fetched from the new repository keeps
+            // the old objects), so its nested state does not apply either way.
+            let sources = vec![Source::WorkingCopy(checkout), released_source()?];
+            optional.push(selected(sources, None));
         }
     }
 
@@ -388,8 +391,40 @@ fn git(repo: &Utf8Path) -> Command {
     command
 }
 
+/// `text` with the userinfo of every `scheme://userinfo@host` URL replaced:
+/// git repeats URLs in its errors, credentials included.
+fn redact_userinfo(text: &str) -> String {
+    let mut redacted = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(scheme_end) = rest.find("://") {
+        let (before, after) = rest.split_at(scheme_end + 3);
+        redacted.push_str(before);
+        let authority_end = after
+            .find(|c: char| c == '/' || c == '\'' || c == '"' || c.is_whitespace())
+            .unwrap_or(after.len());
+        let (authority, tail) = after.split_at(authority_end);
+        match authority.rfind('@') {
+            Some(at) => {
+                redacted.push_str("***");
+                redacted.push_str(&authority[at..]);
+            }
+            None => redacted.push_str(authority),
+        }
+        rest = tail;
+    }
+    redacted.push_str(rest);
+    redacted
+}
+
+/// The stderr of `output`, safe to show.
+fn stderr(output: &std::process::Output) -> String {
+    redact_userinfo(String::from_utf8_lossy(&output.stderr).trim_end())
+}
+
 /// Run `command`, failing on any non-zero exit. Errors name the command by
-/// `description` only: its arguments and environment can hold credentials.
+/// `description` only, its arguments and environment can hold credentials,
+/// and carry git's message with the credentials of the URLs it names
+/// removed.
 fn run(mut command: Command, description: &str) -> anyhow::Result<String> {
     let output = command
         .output()
@@ -397,7 +432,7 @@ fn run(mut command: Command, description: &str) -> anyhow::Result<String> {
     anyhow::ensure!(
         output.status.success(),
         "{description} failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim_end()
+        stderr(&output)
     );
     String::from_utf8(output.stdout).with_context(|| format!("non-UTF-8 output of {description}"))
 }
@@ -412,10 +447,7 @@ fn run_optional(mut command: Command, description: &str) -> anyhow::Result<Optio
             .map(Some)
             .with_context(|| format!("non-UTF-8 output of {description}")),
         Some(1) => Ok(None),
-        _ => anyhow::bail!(
-            "{description} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim_end()
-        ),
+        _ => anyhow::bail!("{description} failed: {}", stderr(&output)),
     }
 }
 
@@ -495,6 +527,32 @@ mod tests {
                 "{remote} + {url}"
             );
         }
+    }
+
+    /// Git repeats a URL in its errors with any credentials it carries: they
+    /// do not reach the error a failed command returns.
+    #[test]
+    fn credentials_in_git_errors_are_redacted() {
+        let dir = crate::fs_utils::Utf8TempDir::new().unwrap();
+        let mut command = git(dir.path());
+        command.args(["init", "-q"]);
+        run(command, "git init").unwrap();
+        // Git repeats the unmatched pathspec verbatim.
+        let mut command = git(dir.path());
+        command.args(["checkout", "https://user:s3cret@example.com/dep.git"]);
+        let error = format!("{:#}", run(command, "git checkout").unwrap_err());
+        assert!(!error.contains("s3cret"), "{error}");
+        assert!(error.contains("example.com/dep.git"), "{error}");
+    }
+
+    #[test]
+    fn userinfo_is_redacted_from_every_url() {
+        assert_eq!(
+            redact_userinfo(
+                "clone of 'https://user:pw@host/a' and ssh://git@host:22/b, not a@b or file:///c"
+            ),
+            "clone of 'https://***@host/a' and ssh://***@host:22/b, not a@b or file:///c"
+        );
     }
 
     #[test]

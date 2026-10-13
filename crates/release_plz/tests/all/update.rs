@@ -1460,6 +1460,35 @@ fn git_only_update_reconstructs_nested_submodules_of_a_replaced_repository() {
     assert_git_only_patch_release(&temp_dir, &repo);
 }
 
+/// A submodule moved to a mirror of the same history is still checked out
+/// from the working copy, which has the released commit, once the original
+/// URL no longer answers.
+#[test]
+fn git_only_update_reconstructs_submodules_moved_to_a_mirror() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let dep = crate_repo(&temp_dir.path().join("dep"), "dep", "");
+    let repo = git_only_app(temp_dir.path(), "dep = { path = \"vendor/dep\" }");
+    add_submodule(&repo, dep.directory(), "vendor/dep");
+    generate_lockfile(repo.directory());
+    repo.add_all_and_commit("chore: add dep").unwrap();
+    repo.tag_lightweight("v0.1.0").unwrap();
+
+    let mirror = temp_dir.path().join("mirror");
+    git_cmd::git_in_dir(
+        temp_dir.path(),
+        &["clone", "--bare", dep.directory().as_str(), mirror.as_str()],
+    )
+    .unwrap();
+    repo.git(&["submodule", "set-url", "vendor/dep", mirror.as_str()])
+        .unwrap();
+    repo.add_all_and_commit("chore: fetch dep from its mirror")
+        .unwrap();
+    fs_err::remove_dir_all(dep.directory()).unwrap();
+    change_app(&repo);
+
+    assert_git_only_patch_release(&temp_dir, &repo);
+}
+
 /// Git configuration for the submodules of these tests, whose URLs are local
 /// paths that git refuses to clone by default.
 const ALLOW_FILE: [&str; 2] = ["-c", "protocol.file.allow=always"];
