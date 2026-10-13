@@ -2,10 +2,10 @@
 //! submodule directory empty.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::process::{Command, Output};
+use std::process::Command;
 
 use anyhow::Context;
-use cargo_metadata::camino::Utf8Path;
+use cargo_metadata::camino::{Utf8Path, Utf8PathBuf};
 use tracing::{debug, warn};
 
 /// A submodule as a `.gitmodules` file declares it, keyed by its name.
@@ -14,30 +14,53 @@ struct Declared {
     url: Option<String>,
 }
 
-/// A submodule of the release to check out, with the URL to fetch it from.
+/// Where a submodule of the release can be fetched from.
+enum Source {
+    /// The working copy's checkout of the same repository: its history is
+    /// already there, so nothing is fetched over the network.
+    WorkingCopy(Utf8PathBuf),
+    /// A repository URL.
+    Url(String),
+}
+
+impl Source {
+    fn describe(&self) -> &'static str {
+        match self {
+            Self::WorkingCopy(_) => "the working copy",
+            Self::Url(_) => "its URL",
+        }
+    }
+}
+
+/// A submodule of the release to check out.
 struct Selected<'a> {
     name: &'a str,
     path: &'a str,
-    url: String,
+    /// Tried in order until one has the commit the release records.
+    sources: Vec<Source>,
+    /// The working copy's checkout of the same repository, which decides
+    /// the nested submodules.
+    counterpart: Option<Utf8PathBuf>,
 }
 
 /// Check out in `release`, a worktree of a release commit, the submodules the
 /// working copy at `working_copy` reads, at the commits the release records.
 ///
 /// Submodules are matched by name, so one moved since the release is found.
-/// Those checked out in the working copy are required. Those the working copy
-/// no longer declares are tried, as only the release knows whether it needs
-/// them: failing to fetch one only warns, since a release that needs it fails
-/// later with Cargo's error anyway. Those the working copy declares but leaves
-/// uninitialized stay so. Nested submodules follow the same rules against the
-/// working copy's nested state. No git configuration is written: URLs are
-/// passed to each command.
+/// Those checked out in the working copy are required, and fetched from that
+/// checkout first. Those the working copy no longer declares, or whose
+/// repository it replaced, are tried, as only the release knows whether it
+/// needs them: failing to fetch one only warns, since a release that needs it
+/// fails later with Cargo's error anyway. Those the working copy declares but
+/// leaves uninitialized stay so. Nested submodules follow the same rules
+/// against the working copy's checkout of the same repository. No git
+/// configuration is written.
 pub(crate) fn check_out(release: &Utf8Path, working_copy: &Utf8Path) -> anyhow::Result<()> {
     check_out_level(release, Some(working_copy))
 }
 
-/// One level of [`check_out`]: `working_copy` is the counterpart of `release`
-/// in the working copy, if the working copy has it checked out.
+/// One level of [`check_out`]: `working_copy` is the working copy's checkout
+/// of the repository `release` checks out, if there is one.
 fn check_out_level(release: &Utf8Path, working_copy: Option<&Utf8Path>) -> anyhow::Result<()> {
     let declared = declared(&release.join(".gitmodules"))?;
     if declared.is_empty() {
@@ -52,7 +75,7 @@ fn check_out_level(release: &Utf8Path, working_copy: Option<&Utf8Path>) -> anyho
     let base = remote_url(working_copy.unwrap_or(release))?;
 
     let mut required = Vec::new();
-    let mut removed = Vec::new();
+    let mut optional = Vec::new();
     for (name, submodule) in &declared {
         // A `.gitmodules` entry without a gitlink is not a submodule.
         if !gitlinks.contains(&submodule.path) {
@@ -62,85 +85,157 @@ fn check_out_level(release: &Utf8Path, working_copy: Option<&Utf8Path>) -> anyho
             warn!("submodule {name} of the release has no URL; it is not checked out");
             continue;
         };
-        match current.get(name.as_str()) {
-            Some((current, _)) if !is_checked_out(working_copy, &current.path) => {}
-            Some((current, configured)) => {
-                // The working copy's URL can be a mirror or carry credentials: keep
-                // it unless the release records another repository.
-                let url = match configured {
-                    Some(url) if current.url.as_ref() == Some(released_url) => url.clone(),
-                    _ => resolve_url(&base, released_url)?,
-                };
-                required.push(Selected {
-                    name,
-                    path: &submodule.path,
-                    url,
-                });
-            }
-            None => removed.push(Selected {
-                name,
-                path: &submodule.path,
-                url: resolve_url(&base, released_url)?,
-            }),
+        let released_source = || resolve_url(&base, released_url).map(Source::Url);
+        let selected = |sources, counterpart| Selected {
+            name,
+            path: &submodule.path,
+            sources,
+            counterpart,
+        };
+        let Some((current, configured)) = current.get(name.as_str()) else {
+            optional.push(selected(vec![released_source()?], None));
+            continue;
+        };
+        let Some(checkout) = working_copy
+            .map(|dir| dir.join(&current.path))
+            .filter(|dir| dir.join(".git").exists())
+        else {
+            // Declared and left uninitialized: not needed.
+            continue;
+        };
+        if current.url.as_ref() == Some(released_url) {
+            // The working copy can lack the released commit, e.g. in a shallow
+            // checkout; its configured URL can then still have it.
+            let remote = match configured {
+                Some(url) => Source::Url(url.clone()),
+                None => released_source()?,
+            };
+            let sources = vec![Source::WorkingCopy(checkout.clone()), remote];
+            required.push(selected(sources, Some(checkout)));
+        } else {
+            // The repository was replaced: the working copy's checkout is
+            // another repository.
+            optional.push(selected(vec![released_source()?], None));
         }
     }
 
-    update(release, &required).context("check out the submodules of the release")?;
-    if let Err(error) = update(release, &removed) {
-        warn!("cannot check out submodules of the release removed since: {error:?}");
-    }
-
     for submodule in &required {
-        let nested_working_copy = working_copy.and_then(|dir| {
-            let (current, _) = current.get(submodule.name)?;
-            Some(dir.join(&current.path))
-        });
+        check_out_submodule(release, submodule)?;
         check_out_level(
             &release.join(submodule.path),
-            nested_working_copy.as_deref(),
+            submodule.counterpart.as_deref(),
         )?;
     }
-    for submodule in &removed {
-        let dir = release.join(submodule.path);
-        if dir.join(".git").exists() {
-            check_out_level(&dir, None)?;
+    for submodule in &optional {
+        match check_out_submodule(release, submodule) {
+            Ok(()) => check_out_level(&release.join(submodule.path), None)?,
+            Err(error) => warn!("{error:?}"),
         }
     }
     Ok(())
 }
 
-fn is_checked_out(working_copy: Option<&Utf8Path>, path: &str) -> bool {
-    working_copy.is_some_and(|dir| dir.join(path).join(".git").exists())
+/// Check out one submodule of `repo` at the commit `repo` records, from the
+/// first of its sources that has it.
+fn check_out_submodule(repo: &Utf8Path, submodule: &Selected<'_>) -> anyhow::Result<()> {
+    let mut failures = Vec::new();
+    for source in &submodule.sources {
+        match update(repo, submodule, source) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                debug!("{error:?}");
+                failures.push(format!("from {}: {error:#}", source.describe()));
+                discard_clone(repo, submodule)?;
+            }
+        }
+    }
+    anyhow::bail!(
+        "cannot check out submodule {} of the release at {repo}:\n{}",
+        submodule.path,
+        failures.join("\n")
+    )
 }
 
-/// Check out `submodules` in `repo` at the commits it records, whatever update
-/// procedure is configured for them.
-fn update(repo: &Utf8Path, submodules: &[Selected<'_>]) -> anyhow::Result<()> {
-    if submodules.is_empty() {
-        return Ok(());
-    }
+/// Check out `submodule` in `repo` from `source`, whatever update procedure is
+/// configured for it.
+fn update(repo: &Utf8Path, submodule: &Selected<'_>, source: &Source) -> anyhow::Result<()> {
     debug!(
-        "checking out submodules {:?} in {repo}",
-        submodules.iter().map(|s| s.path).collect::<Vec<_>>()
+        "checking out submodule {} in {repo} from {}",
+        submodule.path,
+        source.describe()
     );
     let mut command = git(repo);
-    // Paths are literal, not patterns.
-    command.arg("--literal-pathspecs");
-    for submodule in submodules {
-        // Without `--init`, git reads the URL and the active state from the
-        // configuration instead of writing them into it.
-        command
-            .arg("-c")
-            .arg(format!(
-                "submodule.{}.url={}",
-                submodule.name, submodule.url
-            ))
-            .arg("-c")
-            .arg(format!("submodule.{}.active=true", submodule.name));
+    // Without `--init`, git reads the URL and the active state from this
+    // configuration instead of writing them into the repository's. Keys and
+    // values go separately through the environment: a name can contain `=`,
+    // and the URL can carry credentials.
+    let url_key = format!("submodule.{}.url", submodule.name);
+    let active_key = format!("submodule.{}.active", submodule.name);
+    let mut config = vec![(active_key.as_str(), "true")];
+    match source {
+        Source::WorkingCopy(dir) => {
+            config.push((url_key.as_str(), dir.as_str()));
+            // A path to the user's own checkout, chosen here, not by `.gitmodules`.
+            config.push(("protocol.file.allow", "always"));
+        }
+        Source::Url(url) => config.push((url_key.as_str(), url)),
     }
-    command.args(["submodule", "update", "--checkout", "--"]);
-    command.args(submodules.iter().map(|s| s.path));
-    run(command).map(drop)
+    add_config(&mut command, &config)?;
+    // Paths are literal, not patterns.
+    command.args([
+        "--literal-pathspecs",
+        "submodule",
+        "update",
+        "--checkout",
+        "--",
+    ]);
+    command.arg(submodule.path);
+    run(
+        command,
+        &format!("git submodule update of {}", submodule.path),
+    )
+    .map(drop)
+}
+
+/// Remove what a failed checkout of `submodule` left in `repo`, so the next
+/// source starts afresh instead of reusing a clone of the previous one.
+fn discard_clone(repo: &Utf8Path, submodule: &Selected<'_>) -> anyhow::Result<()> {
+    let mut command = git(repo);
+    command.args([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        &format!("modules/{}", submodule.name),
+    ]);
+    let module = run(command, "git rev-parse --git-path")?;
+    let module = Utf8Path::new(module.trim_end_matches('\n'));
+    if module.exists() {
+        fs_err::remove_dir_all(module)?;
+    }
+    let checkout = repo.join(submodule.path);
+    if checkout.exists() {
+        fs_err::remove_dir_all(&checkout)?;
+    }
+    fs_err::create_dir_all(&checkout)?;
+    Ok(())
+}
+
+/// Add `entries` to the configuration git reads from the environment, after
+/// any the caller's environment already sets.
+fn add_config(command: &mut Command, entries: &[(&str, &str)]) -> anyhow::Result<()> {
+    let inherited = match std::env::var("GIT_CONFIG_COUNT") {
+        Ok(count) => count
+            .parse::<usize>()
+            .with_context(|| format!("invalid GIT_CONFIG_COUNT {count:?}"))?,
+        Err(_) => 0,
+    };
+    for (index, &(key, value)) in (inherited..).zip(entries) {
+        command
+            .env(format!("GIT_CONFIG_KEY_{index}"), key)
+            .env(format!("GIT_CONFIG_VALUE_{index}"), value);
+    }
+    command.env("GIT_CONFIG_COUNT", (inherited + entries.len()).to_string());
+    Ok(())
 }
 
 /// The submodules a `.gitmodules` file declares, empty if there is none.
@@ -153,7 +248,7 @@ fn declared(gitmodules: &Utf8Path) -> anyhow::Result<BTreeMap<String, Declared>>
         .args(["config", "-z", "-f"])
         .arg(gitmodules)
         .args(["--get-regexp", r"^submodule\..*\.(path|url)$"]);
-    let Some(entries) = run_optional(command)? else {
+    let Some(entries) = run_optional(command, &format!("reading {gitmodules}"))? else {
         return Ok(BTreeMap::new());
     };
     let mut declared = BTreeMap::new();
@@ -203,7 +298,7 @@ fn declared_with_config(
 fn gitlinks(repo: &Utf8Path) -> anyhow::Result<BTreeSet<String>> {
     let mut command = git(repo);
     command.args(["ls-files", "--stage", "-z"]);
-    let index = run(command)?;
+    let index = run(command, "git ls-files")?;
     Ok(index
         .split_terminator('\0')
         .filter_map(|entry| {
@@ -219,7 +314,7 @@ fn gitlinks(repo: &Utf8Path) -> anyhow::Result<BTreeSet<String>> {
 fn remote_url(repo: &Utf8Path) -> anyhow::Result<String> {
     let mut command = git(repo);
     command.args(["symbolic-ref", "-q", "--short", "HEAD"]);
-    let branch_remote = match run_optional(command)? {
+    let branch_remote = match run_optional(command, "git symbolic-ref")? {
         Some(branch) => config(repo, &format!("branch.{}.remote", branch.trim_end()))?,
         None => None,
     };
@@ -227,14 +322,15 @@ fn remote_url(repo: &Utf8Path) -> anyhow::Result<String> {
     Ok(config(repo, &format!("remote.{remote}.url"))?.unwrap_or_else(|| repo.to_string()))
 }
 
-/// Resolve a submodule URL against the superproject's remote URL, as git
-/// does: a URL starting with `./` or `../` is relative to `remote`, any other
-/// is used as is.
+/// Resolve a submodule URL against the superproject's remote URL, as git's
+/// `relative_url` does: a URL starting with `./` or `../` is relative to
+/// `remote`, any other is used as is.
 fn resolve_url(remote: &str, url: &str) -> anyhow::Result<String> {
     if !url.starts_with("./") && !url.starts_with("../") {
         return Ok(url.to_owned());
     }
-    let mut base = remote.trim_end_matches('/').to_owned();
+    // Git drops a single trailing separator; any other is a path component.
+    let mut base = remote.strip_suffix('/').unwrap_or(remote).to_owned();
     let is_relative = is_local_not_ssh(&base) && !Utf8Path::new(&base).is_absolute();
     if is_relative && !base.starts_with("./") && !base.starts_with("../") {
         base.insert_str(0, "./");
@@ -261,7 +357,10 @@ fn resolve_url(remote: &str, url: &str) -> anyhow::Result<String> {
         }
     }
     let separator = if colon_separated { ":" } else { "/" };
-    let resolved = format!("{base}{separator}{}", rest.trim_end_matches('/'));
+    let resolved = format!(
+        "{base}{separator}{}",
+        rest.strip_suffix('/').unwrap_or(rest)
+    );
     Ok(resolved
         .strip_prefix("./")
         .map_or_else(|| resolved.clone(), str::to_owned))
@@ -279,7 +378,8 @@ fn is_local_not_ssh(url: &str) -> bool {
 fn config(repo: &Utf8Path, key: &str) -> anyhow::Result<Option<String>> {
     let mut command = git(repo);
     command.args(["config", "--get", key]);
-    Ok(run_optional(command)?.map(|value| value.trim_end_matches('\n').to_owned()))
+    let value = run_optional(command, &format!("reading {key}"))?;
+    Ok(value.map(|value| value.trim_end_matches('\n').to_owned()))
 }
 
 fn git(repo: &Utf8Path) -> Command {
@@ -288,38 +388,35 @@ fn git(repo: &Utf8Path) -> Command {
     command
 }
 
-/// Run `command`, failing on any non-zero exit.
-fn run(command: Command) -> anyhow::Result<String> {
-    let (output, description) = output(command)?;
+/// Run `command`, failing on any non-zero exit. Errors name the command by
+/// `description` only: its arguments and environment can hold credentials.
+fn run(mut command: Command, description: &str) -> anyhow::Result<String> {
+    let output = command
+        .output()
+        .with_context(|| format!("cannot run {description}"))?;
     anyhow::ensure!(
         output.status.success(),
-        "`{description}` failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "{description} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim_end()
     );
-    String::from_utf8(output.stdout).with_context(|| format!("non-UTF-8 output of `{description}`"))
+    String::from_utf8(output.stdout).with_context(|| format!("non-UTF-8 output of {description}"))
 }
 
 /// Run `command`, whose exit code 1 means nothing was found.
-fn run_optional(command: Command) -> anyhow::Result<Option<String>> {
-    let (output, description) = output(command)?;
+fn run_optional(mut command: Command, description: &str) -> anyhow::Result<Option<String>> {
+    let output = command
+        .output()
+        .with_context(|| format!("cannot run {description}"))?;
     match output.status.code() {
         Some(0) => String::from_utf8(output.stdout)
             .map(Some)
-            .with_context(|| format!("non-UTF-8 output of `{description}`")),
+            .with_context(|| format!("non-UTF-8 output of {description}")),
         Some(1) => Ok(None),
         _ => anyhow::bail!(
-            "`{description}` failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "{description} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim_end()
         ),
     }
-}
-
-fn output(mut command: Command) -> anyhow::Result<(Output, String)> {
-    let description = format!("{command:?}");
-    let output = command
-        .output()
-        .with_context(|| format!("cannot run `{description}`"))?;
-    Ok((output, description))
 }
 
 #[cfg(test)]
@@ -367,6 +464,30 @@ mod tests {
                 "https://other.com/dep",
             ),
             ("https://example.com/group/app", "/srv/dep", "/srv/dep"),
+        ] {
+            assert_eq!(
+                resolve_url(remote, url).unwrap(),
+                expected,
+                "{remote} + {url}"
+            );
+        }
+    }
+
+    /// Git drops one trailing separator of the remote and of the URL, so the
+    /// others count as directory components.
+    #[test]
+    fn only_one_trailing_separator_is_dropped() {
+        for (remote, url, expected) in [
+            (
+                "https://example.com/group/app//",
+                "../dep",
+                "https://example.com/group/app/dep",
+            ),
+            (
+                "https://example.com/group/app",
+                "../dep//",
+                "https://example.com/group/dep/",
+            ),
         ] {
             assert_eq!(
                 resolve_url(remote, url).unwrap(),

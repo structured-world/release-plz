@@ -1297,6 +1297,169 @@ fn git_only_update_tolerates_unreachable_submodules_removed_since() {
     assert_git_only_patch_release_of(&temp_dir, &repo, "app/Cargo.toml");
 }
 
+/// The working copy already holds the submodule's history: it is checked out
+/// from there, so an unreachable remote, or one needing credentials only the
+/// working copy's own fetch had, does not matter.
+#[test]
+fn git_only_update_reconstructs_submodules_from_the_working_copy() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let dep = crate_repo(&temp_dir.path().join("dep"), "dep", "");
+    let repo = git_only_app(temp_dir.path(), "dep = { path = \"vendor/dep\" }");
+    add_submodule(&repo, dep.directory(), "vendor/dep");
+    release_then_fix(&repo);
+    fs_err::remove_dir_all(dep.directory()).unwrap();
+
+    assert_git_only_patch_release(&temp_dir, &repo);
+}
+
+/// A submodule name can contain `=`, which a `name=value` configuration
+/// argument would split at.
+#[test]
+fn git_only_update_reconstructs_submodules_whose_name_has_an_equals_sign() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let dep = crate_repo(&temp_dir.path().join("dep"), "dep", "");
+    let repo = git_only_app(temp_dir.path(), "dep = { path = \"vendor/dep\" }");
+    repo.git(&[
+        ALLOW_FILE[0],
+        ALLOW_FILE[1],
+        "submodule",
+        "add",
+        "--name",
+        "a=b",
+        dep.directory().as_str(),
+        "vendor/dep",
+    ])
+    .unwrap();
+    release_then_fix(&repo);
+    fs_err::remove_dir_all(dep.directory()).unwrap();
+
+    assert_git_only_patch_release(&temp_dir, &repo);
+}
+
+/// Submodules removed since the release are fetched one by one: an
+/// unreachable one does not stop another the release needs.
+#[test]
+fn git_only_update_isolates_failures_of_submodules_removed_since() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let dep = crate_repo(&temp_dir.path().join("dep"), "dep", "");
+    let extra_dir = temp_dir.path().join("extra");
+    crate_repo(&extra_dir, "extra", "");
+    let dir = temp_dir.path().join("project");
+    for (member, dependencies) in [("app", ""), ("b", "dep = { path = \"../vendor/dep\" }")] {
+        fs_err::create_dir_all(dir.join(member).join("src")).unwrap();
+        fs_err::write(
+            dir.join(member).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+                 publish = false\n\n[dependencies]\n{dependencies}\n"
+            ),
+        )
+        .unwrap();
+        fs_err::write(dir.join(member).join("src/lib.rs"), "// Initial release\n").unwrap();
+    }
+    fs_err::write(
+        dir.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"b\"]\nexclude = [\"vendor\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    fs_err::write(
+        dir.join("release-plz.toml"),
+        "[workspace]\ngit_only = true\npublish = false\nsemver_check = false\n",
+    )
+    .unwrap();
+    let repo = Repo::init(&dir);
+    // Sorted before `vendor/dep`, so a single command would try it first.
+    add_submodule(&repo, &extra_dir, "vendor/a-extra");
+    add_submodule(&repo, dep.directory(), "vendor/dep");
+    generate_lockfile(&dir);
+    repo.add_all_and_commit("chore: add submodules").unwrap();
+    repo.tag_lightweight("app-v0.1.0").unwrap();
+    repo.tag_lightweight("b-v0.1.0").unwrap();
+
+    repo.git(&["rm", "vendor/a-extra", "vendor/dep"]).unwrap();
+    fs_err::write(
+        dir.join("b/Cargo.toml"),
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n",
+    )
+    .unwrap();
+    generate_lockfile(&dir);
+    repo.add_all_and_commit("fix: drop the submodules").unwrap();
+    // As in a fresh clone, which has no trace of the removed submodules.
+    for name in ["vendor/a-extra", "vendor/dep"] {
+        repo.git(&["config", "--remove-section", &format!("submodule.{name}")])
+            .unwrap();
+    }
+    fs_err::remove_dir_all(dir.join(".git/modules/vendor")).unwrap();
+    fs_err::remove_dir_all(&extra_dir).unwrap();
+    fs_err::write(dir.join("app/src/lib.rs"), "// Fixed\n").unwrap();
+    repo.add_all_and_commit("fix: update app").unwrap();
+
+    assert_git_only_patch_release_of(&temp_dir, &repo, "app/Cargo.toml");
+}
+
+/// Once a submodule's repository was replaced, the working copy's checkout
+/// of it says nothing about the released repository's nested submodules:
+/// one the release needs is fetched although the replacement leaves its
+/// namesake uninitialized.
+#[test]
+fn git_only_update_reconstructs_nested_submodules_of_a_replaced_repository() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let inner_dir = temp_dir.path().join("inner");
+    crate_repo(&inner_dir, "inner", "");
+    let old = crate_repo(
+        &temp_dir.path().join("old"),
+        "dep",
+        "[dependencies]\ninner = { path = \"inner\" }\n",
+    );
+    add_submodule(&old, &inner_dir, "inner");
+    old.add_all_and_commit("add inner").unwrap();
+    let new = crate_repo(&temp_dir.path().join("new"), "dep", "");
+    add_submodule(&new, &inner_dir, "inner");
+    new.add_all_and_commit("add inner").unwrap();
+
+    let repo = git_only_app(temp_dir.path(), "dep = { path = \"vendor/dep\" }");
+    add_submodule(&repo, old.directory(), "vendor/dep");
+    repo.git(&[
+        ALLOW_FILE[0],
+        ALLOW_FILE[1],
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+    ])
+    .unwrap();
+    generate_lockfile(repo.directory());
+    repo.add_all_and_commit("chore: add dep").unwrap();
+    repo.tag_lightweight("v0.1.0").unwrap();
+
+    repo.git(&[
+        "submodule",
+        "set-url",
+        "vendor/dep",
+        new.directory().as_str(),
+    ])
+    .unwrap();
+    let submodule = repo.directory().join("vendor/dep");
+    git_cmd::git_in_dir(&submodule, &["submodule", "deinit", "-f", "inner"]).unwrap();
+    git_cmd::git_in_dir(
+        &submodule,
+        &[
+            ALLOW_FILE[0],
+            ALLOW_FILE[1],
+            "fetch",
+            new.directory().as_str(),
+        ],
+    )
+    .unwrap();
+    git_cmd::git_in_dir(&submodule, &["checkout", "FETCH_HEAD"]).unwrap();
+    generate_lockfile(repo.directory());
+    repo.add_all_and_commit("chore: replace dep repository")
+        .unwrap();
+    change_app(&repo);
+
+    assert_git_only_patch_release(&temp_dir, &repo);
+}
+
 /// Git configuration for the submodules of these tests, whose URLs are local
 /// paths that git refuses to clone by default.
 const ALLOW_FILE: [&str; 2] = ["-c", "protocol.file.allow=always"];
