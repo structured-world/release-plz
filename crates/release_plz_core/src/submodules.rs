@@ -41,27 +41,37 @@ struct Selected<'a> {
     /// The working copy's checkout of the same repository, which decides
     /// the nested submodules.
     counterpart: Option<Utf8PathBuf>,
+    /// Without a counterpart, the URL the release records for the
+    /// submodule: its nested submodules' relative URLs resolve against it,
+    /// whichever source the checkout came from.
+    released_url: Option<String>,
 }
 
 /// Check out in `release`, a worktree of a release commit, the submodules the
 /// working copy at `working_copy` reads, at the commits the release records.
 ///
-/// Submodules are matched by name, so one moved since the release is found.
-/// Those checked out in the working copy are required, and fetched from that
-/// checkout first. Those the working copy no longer declares, or now fetches
-/// from another URL (from its checkout first, in case that is a mirror), are
-/// tried, as only the release knows whether it needs them: failing to fetch one only warns, since a release that needs it
-/// fails later with Cargo's error anyway. Those the working copy declares but
-/// leaves uninitialized stay so. Nested submodules follow the same rules
-/// against the working copy's checkout of the same repository. No git
-/// configuration is written.
+/// Submodules are matched by name, so one moved since the release is found,
+/// and one renamed since by its URL or path. Those checked out in the working
+/// copy are required, and fetched from that checkout first. Those the working
+/// copy no longer declares, or now fetches from another URL (from its
+/// checkout first, in case that is a mirror), are tried, as only the release
+/// knows whether it needs them: failing to fetch one only warns, since a
+/// release that needs it fails later with Cargo's error anyway. Those the
+/// working copy declares but leaves uninitialized stay so. Nested submodules
+/// follow the same rules against the working copy's checkout of the same
+/// repository. No git configuration is written.
 pub(crate) fn check_out(release: &Utf8Path, working_copy: &Utf8Path) -> anyhow::Result<()> {
-    check_out_level(release, Some(working_copy))
+    check_out_level(release, Some(working_copy), None)
 }
 
 /// One level of [`check_out`]: `working_copy` is the working copy's checkout
-/// of the repository `release` checks out, if there is one.
-fn check_out_level(release: &Utf8Path, working_copy: Option<&Utf8Path>) -> anyhow::Result<()> {
+/// of the repository `release` checks out, if there is one; otherwise
+/// `released_url` is the URL the release records for it.
+fn check_out_level(
+    release: &Utf8Path,
+    working_copy: Option<&Utf8Path>,
+    released_url: Option<&str>,
+) -> anyhow::Result<()> {
     let declared = declared(&release.join(".gitmodules"))?;
     if declared.is_empty() {
         return Ok(());
@@ -72,7 +82,13 @@ fn check_out_level(release: &Utf8Path, working_copy: Option<&Utf8Path>) -> anyho
         None => BTreeMap::new(),
     };
     // Relative URLs resolve against the superproject's remote, as git does.
-    let base = remote_url(working_copy.unwrap_or(release))?;
+    // A checkout cloned from the working copy has that copy as its remote,
+    // so without a counterpart the URL the release records stands in.
+    let base = match (working_copy, released_url) {
+        (Some(dir), _) => remote_url(dir)?,
+        (None, Some(url)) => url.to_owned(),
+        (None, None) => remote_url(release)?,
+    };
 
     let mut required = Vec::new();
     let mut optional = Vec::new();
@@ -81,19 +97,43 @@ fn check_out_level(release: &Utf8Path, working_copy: Option<&Utf8Path>) -> anyho
         if !gitlinks.contains(&submodule.path) {
             continue;
         }
+        // Git ignores such a name (and checks out nothing); it would also
+        // place the module's repository outside `modules/`.
+        if !is_valid_name(name) {
+            warn!(
+                "submodule name {name:?} of the release is refused by git; it is not checked out"
+            );
+            continue;
+        }
         let Some(released_url) = &submodule.url else {
             warn!("submodule {name} of the release has no URL; it is not checked out");
             continue;
         };
-        let released_source = || resolve_url(&base, released_url).map(Source::Url);
-        let selected = |sources, counterpart| Selected {
+        let released = || resolve_url(&base, released_url);
+        let selected = |sources, counterpart, released_url| Selected {
             name,
             path: &submodule.path,
             sources,
             counterpart,
+            released_url,
         };
-        let Some((current, configured)) = current.get(name.as_str()) else {
-            optional.push(selected(vec![released_source()?], None));
+        // Matched by name; a section renamed since is the same submodule when
+        // it has the same URL, preferably at the same path, or else when it is
+        // at the same path.
+        let matched = current.get(name.as_str()).or_else(|| {
+            let values = || current.values();
+            values()
+                .find(|(c, _)| c.url.as_ref() == Some(released_url) && c.path == submodule.path)
+                .or_else(|| values().find(|(c, _)| c.url.as_ref() == Some(released_url)))
+                .or_else(|| values().find(|(c, _)| c.path == submodule.path))
+        });
+        let Some((current, configured)) = matched else {
+            let released = released()?;
+            optional.push(selected(
+                vec![Source::Url(released.clone())],
+                None,
+                Some(released),
+            ));
             continue;
         };
         let Some(checkout) = working_copy
@@ -107,18 +147,19 @@ fn check_out_level(release: &Utf8Path, working_copy: Option<&Utf8Path>) -> anyho
             // The working copy can lack the released commit, e.g. in a shallow
             // checkout; its configured URL can then still have it.
             let remote = match configured {
-                Some(url) => Source::Url(url.clone()),
-                None => released_source()?,
+                Some(url) => url.clone(),
+                None => released()?,
             };
-            let sources = vec![Source::WorkingCopy(checkout.clone()), remote];
-            required.push(selected(sources, Some(checkout)));
+            let sources = vec![Source::WorkingCopy(checkout.clone()), Source::Url(remote)];
+            required.push(selected(sources, Some(checkout), None));
         } else {
             // Another URL: a mirror of the same history, whose checkout can have
             // the released commit, or a replacement. Having the commit does not
             // tell them apart (a checkout fetched from the new repository keeps
             // the old objects), so its nested state does not apply either way.
-            let sources = vec![Source::WorkingCopy(checkout), released_source()?];
-            optional.push(selected(sources, None));
+            let released = released()?;
+            let sources = vec![Source::WorkingCopy(checkout), Source::Url(released.clone())];
+            optional.push(selected(sources, None, Some(released)));
         }
     }
 
@@ -127,11 +168,16 @@ fn check_out_level(release: &Utf8Path, working_copy: Option<&Utf8Path>) -> anyho
         check_out_level(
             &release.join(submodule.path),
             submodule.counterpart.as_deref(),
+            submodule.released_url.as_deref(),
         )?;
     }
     for submodule in &optional {
         match check_out_submodule(release, submodule) {
-            Ok(()) => check_out_level(&release.join(submodule.path), None)?,
+            Ok(()) => check_out_level(
+                &release.join(submodule.path),
+                None,
+                submodule.released_url.as_deref(),
+            )?,
             Err(error) => warn!("{error:?}"),
         }
     }
@@ -193,9 +239,15 @@ fn update(repo: &Utf8Path, submodule: &Selected<'_>, source: &Source) -> anyhow:
         "--",
     ]);
     command.arg(submodule.path);
-    run(
+    // A URL can carry a token in its path or query, which only it reveals.
+    let urls = match source {
+        Source::WorkingCopy(_) => Vec::new(),
+        Source::Url(url) => vec![url.as_str()],
+    };
+    run_with(
         command,
         &format!("git submodule update of {}", submodule.path),
+        &urls,
     )
     .map(drop)
 }
@@ -391,18 +443,51 @@ fn git(repo: &Utf8Path) -> Command {
     command
 }
 
-/// `text` with the userinfo of every `scheme://userinfo@host` URL replaced:
-/// git repeats URLs in its errors, credentials included.
-fn redact_userinfo(text: &str) -> String {
+/// Whether git accepts `name` as a submodule name: not empty, and without a
+/// `..` component on either separator, so that its repository stays under
+/// `modules/` (git's `check_submodule_name`).
+fn is_valid_name(name: &str) -> bool {
+    !name.is_empty() && !name.split(['/', '\\']).any(|component| component == "..")
+}
+
+/// The authority of the `scheme://` URL `after` starts right after: it ends
+/// at the path, query or fragment (RFC 3986 3.2), and no URL holds
+/// whitespace. Userinfo can hold quotes (RFC 3986 3.2.1).
+fn authority_len(after: &str) -> usize {
+    after
+        .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+        .unwrap_or(after.len())
+}
+
+/// `url` without its userinfo, as git shows some URLs.
+fn without_userinfo(url: &str) -> Option<String> {
+    let scheme_end = url.find("://")? + 3;
+    let authority = &url[scheme_end..scheme_end + authority_len(&url[scheme_end..])];
+    let at = authority.rfind('@')?;
+    Some(format!(
+        "{}{}",
+        &url[..scheme_end],
+        &url[scheme_end + at + 1..]
+    ))
+}
+
+/// `text` with credentials removed from the URLs it names, as git repeats
+/// URLs in its errors: each of `urls` (the URLs given to git, which can
+/// carry a token in their path) wholly, with or without its userinfo, and
+/// the userinfo and query of any other `scheme://` URL.
+fn redact(text: &str, urls: &[&str]) -> String {
+    let mut text = text.to_owned();
+    for url in urls.iter().filter(|url| url.contains("://")) {
+        for form in std::iter::once((*url).to_owned()).chain(without_userinfo(url)) {
+            text = text.replace(&form, "<submodule URL>");
+        }
+    }
     let mut redacted = String::with_capacity(text.len());
-    let mut rest = text;
+    let mut rest = text.as_str();
     while let Some(scheme_end) = rest.find("://") {
         let (before, after) = rest.split_at(scheme_end + 3);
         redacted.push_str(before);
-        let authority_end = after
-            .find(|c: char| c == '/' || c == '\'' || c == '"' || c.is_whitespace())
-            .unwrap_or(after.len());
-        let (authority, tail) = after.split_at(authority_end);
+        let (authority, tail) = after.split_at(authority_len(after));
         match authority.rfind('@') {
             Some(at) => {
                 redacted.push_str("***");
@@ -410,29 +495,46 @@ fn redact_userinfo(text: &str) -> String {
             }
             None => redacted.push_str(authority),
         }
-        rest = tail;
+        // A query can carry a token, as a signed URL does.
+        let path_len = tail
+            .find(|c: char| matches!(c, '?' | '\'' | '"') || c.is_whitespace())
+            .unwrap_or(tail.len());
+        let (path, tail) = tail.split_at(path_len);
+        redacted.push_str(path);
+        rest = match tail.strip_prefix('?') {
+            Some(query) => {
+                redacted.push_str("?***");
+                &query[query.find(char::is_whitespace).unwrap_or(query.len())..]
+            }
+            None => tail,
+        };
     }
     redacted.push_str(rest);
     redacted
 }
 
-/// The stderr of `output`, safe to show.
-fn stderr(output: &std::process::Output) -> String {
-    redact_userinfo(String::from_utf8_lossy(&output.stderr).trim_end())
+/// The stderr of `output`, safe to show (see [`redact`]).
+fn stderr(output: &std::process::Output, urls: &[&str]) -> String {
+    redact(String::from_utf8_lossy(&output.stderr).trim_end(), urls)
 }
 
 /// Run `command`, failing on any non-zero exit. Errors name the command by
 /// `description` only, its arguments and environment can hold credentials,
 /// and carry git's message with the credentials of the URLs it names
 /// removed.
-fn run(mut command: Command, description: &str) -> anyhow::Result<String> {
+fn run(command: Command, description: &str) -> anyhow::Result<String> {
+    run_with(command, description, &[])
+}
+
+/// [`run`] a command given `urls`, which its errors withhold wholly.
+fn run_with(mut command: Command, description: &str, urls: &[&str]) -> anyhow::Result<String> {
     let output = command
         .output()
         .with_context(|| format!("cannot run {description}"))?;
     anyhow::ensure!(
         output.status.success(),
         "{description} failed: {}",
-        stderr(&output)
+        stderr(&output, urls)
     );
     String::from_utf8(output.stdout).with_context(|| format!("non-UTF-8 output of {description}"))
 }
@@ -447,7 +549,7 @@ fn run_optional(mut command: Command, description: &str) -> anyhow::Result<Optio
             .map(Some)
             .with_context(|| format!("non-UTF-8 output of {description}")),
         Some(1) => Ok(None),
-        _ => anyhow::bail!("{description} failed: {}", stderr(&output)),
+        _ => anyhow::bail!("{description} failed: {}", stderr(&output, &[])),
     }
 }
 
@@ -548,11 +650,105 @@ mod tests {
     #[test]
     fn userinfo_is_redacted_from_every_url() {
         assert_eq!(
-            redact_userinfo(
-                "clone of 'https://user:pw@host/a' and ssh://git@host:22/b, not a@b or file:///c"
+            redact(
+                "clone of 'https://user:pw@host/a' and ssh://git@host:22/b, not a@b or file:///c",
+                &[]
             ),
             "clone of 'https://***@host/a' and ssh://***@host:22/b, not a@b or file:///c"
         );
+    }
+
+    /// Userinfo can hold a quote (RFC 3986 3.2.1): the authority runs to the
+    /// path, query or fragment, not to the quote.
+    #[test]
+    fn userinfo_with_a_quote_is_redacted() {
+        assert_eq!(
+            redact("'https://user:pa'ss@host/x'", &[]),
+            "'https://***@host/x'"
+        );
+    }
+
+    /// A query can carry a token, as a signed URL does.
+    #[test]
+    fn queries_are_redacted_from_every_url() {
+        assert_eq!(
+            redact("access to 'https://host/a?token=s3cret' denied", &[]),
+            "access to 'https://host/a?*** denied"
+        );
+    }
+
+    /// A URL given to git can carry a token in its path: it is withheld
+    /// wherever git repeats it, with or without the userinfo git may strip.
+    #[test]
+    fn urls_given_to_git_are_withheld() {
+        let url = "https://user:pw@host/T0KEN/dep.git";
+        for text in [
+            "fatal: repository 'https://user:pw@host/T0KEN/dep.git/' not found",
+            "fatal: unable to access 'https://host/T0KEN/dep.git/': 403",
+        ] {
+            let redacted = redact(text, &[url]);
+            assert!(!redacted.contains("T0KEN"), "{redacted}");
+            assert!(!redacted.contains("pw"), "{redacted}");
+        }
+    }
+
+    /// A name with a `..` component, which git refuses, names a directory
+    /// outside the repository's metadata: the checkout skips it and removes
+    /// nothing there.
+    #[test]
+    fn a_name_climbing_out_of_the_metadata_removes_nothing() {
+        let dir = crate::fs_utils::Utf8TempDir::new().unwrap();
+        let git_ok = |repo: &Utf8Path, args: &[&str]| {
+            let mut command = git(repo);
+            command
+                .args(["-c", "protocol.file.allow=always"])
+                .args(args);
+            run(command, "git").unwrap();
+        };
+        let victim = dir.path().join("victim");
+        fs_err::create_dir_all(&victim).unwrap();
+        fs_err::write(victim.join("keep"), "").unwrap();
+        let dep = dir.path().join("dep");
+        fs_err::create_dir_all(&dep).unwrap();
+        git_ok(&dep, &["init", "-q"]);
+        git_ok(&dep, &["commit", "-q", "--allow-empty", "-m", "dep"]);
+        let superproject = dir.path().join("super");
+        fs_err::create_dir_all(&superproject).unwrap();
+        git_ok(&superproject, &["init", "-q"]);
+        git_ok(
+            &superproject,
+            &["submodule", "add", "-q", dep.as_str(), "dep"],
+        );
+        git_ok(
+            &superproject,
+            &[
+                "config",
+                "-f",
+                ".gitmodules",
+                "--rename-section",
+                "submodule.dep",
+                "submodule.../../../victim",
+            ],
+        );
+        git_ok(&superproject, &["commit", "-qam", "release"]);
+        let release = dir.path().join("release");
+        git_ok(
+            &superproject,
+            &["worktree", "add", "-q", "--detach", release.as_str()],
+        );
+
+        check_out(&release, &superproject).unwrap();
+        assert!(victim.join("keep").exists(), "removed outside the metadata");
+    }
+
+    #[test]
+    fn git_refuses_names_with_a_parent_component() {
+        for name in ["../x", "a/../x", "a\\..\\x", "..", ""] {
+            assert!(!is_valid_name(name), "{name:?}");
+        }
+        for name in ["a..b", "..a", "a/..b", "vendor/dep", "a=b"] {
+            assert!(is_valid_name(name), "{name:?}");
+        }
     }
 
     #[test]

@@ -1489,6 +1489,90 @@ fn git_only_update_reconstructs_submodules_moved_to_a_mirror() {
     assert_git_only_patch_release(&temp_dir, &repo);
 }
 
+/// A submodule whose `.gitmodules` section was renamed after the release is
+/// the same repository at the same URL: it is still checked out from the
+/// working copy once that URL no longer answers.
+#[test]
+fn git_only_update_reconstructs_submodules_renamed_since() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let dep = crate_repo(&temp_dir.path().join("dep"), "dep", "");
+    let repo = git_only_app(temp_dir.path(), "dep = { path = \"vendor/dep\" }");
+    add_submodule(&repo, dep.directory(), "vendor/dep");
+    generate_lockfile(repo.directory());
+    repo.add_all_and_commit("chore: add dep").unwrap();
+    repo.tag_lightweight("v0.1.0").unwrap();
+
+    repo.git(&[
+        "config",
+        "-f",
+        ".gitmodules",
+        "--rename-section",
+        "submodule.vendor/dep",
+        "submodule.dep",
+    ])
+    .unwrap();
+    repo.add_all_and_commit("chore: rename dep").unwrap();
+    fs_err::remove_dir_all(dep.directory()).unwrap();
+    change_app(&repo);
+
+    assert_git_only_patch_release(&temp_dir, &repo);
+}
+
+/// A submodule fetched from the working copy, after its URL moved to a
+/// mirror, resolves the relative URLs of its own submodules against the
+/// repository the release records, not against the checkout it was cloned
+/// from.
+#[test]
+fn git_only_update_resolves_nested_urls_against_the_released_repository() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let repos = temp_dir.path().join("repos");
+    crate_repo(&repos.join("inner"), "inner", "");
+    let dep = crate_repo(
+        &repos.join("dep"),
+        "dep",
+        "[dependencies]\ninner = { path = \"inner\" }\n",
+    );
+    dep.git(&[
+        ALLOW_FILE[0],
+        ALLOW_FILE[1],
+        "submodule",
+        "add",
+        "../inner",
+        "inner",
+    ])
+    .unwrap();
+    dep.add_all_and_commit("add inner").unwrap();
+    let repo = git_only_app(temp_dir.path(), "dep = { path = \"vendor/dep\" }");
+    add_submodule(&repo, dep.directory(), "vendor/dep");
+    repo.git(&[
+        ALLOW_FILE[0],
+        ALLOW_FILE[1],
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+    ])
+    .unwrap();
+    generate_lockfile(repo.directory());
+    repo.add_all_and_commit("chore: add dep").unwrap();
+    repo.tag_lightweight("v0.1.0").unwrap();
+
+    let mirror = temp_dir.path().join("mirrors/dep");
+    git_cmd::git_in_dir(
+        temp_dir.path(),
+        &["clone", "--bare", dep.directory().as_str(), mirror.as_str()],
+    )
+    .unwrap();
+    repo.git(&["submodule", "set-url", "vendor/dep", mirror.as_str()])
+        .unwrap();
+    repo.add_all_and_commit("chore: fetch dep from its mirror")
+        .unwrap();
+    fs_err::remove_dir_all(dep.directory()).unwrap();
+    change_app(&repo);
+
+    assert_git_only_patch_release(&temp_dir, &repo);
+}
+
 /// Git configuration for the submodules of these tests, whose URLs are local
 /// paths that git refuses to clone by default.
 const ALLOW_FILE: [&str; 2] = ["-c", "protocol.file.allow=always"];
