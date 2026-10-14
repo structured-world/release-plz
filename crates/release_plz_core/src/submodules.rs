@@ -156,12 +156,19 @@ fn check_out_level(
             // checkout; its configured URL can then still have it, and when
             // that overrides the recorded one, the recorded one can.
             let released = released()?;
+            let overridden = configured.as_ref().filter(|url| **url != released);
             let mut sources = vec![Source::WorkingCopy(checkout.clone())];
-            if let Some(url) = configured.as_ref().filter(|url| **url != released) {
+            if let Some(url) = overridden {
                 sources.push(Source::Url(url.clone()));
             }
-            sources.push(Source::Url(released));
-            required.push(selected(sources, Some(checkout), None));
+            sources.push(Source::Url(released.clone()));
+            // A checkout of the overriding repository, like one fetched from
+            // another URL below, says nothing of the released nested state.
+            let submodule = match overridden {
+                None => selected(sources, Some(checkout), None),
+                Some(_) => selected(sources, None, Some(released)),
+            };
+            required.push(submodule);
         } else {
             // Another URL: a mirror of the same history, whose checkout can have
             // the released commit, or a replacement. Having the commit does not
@@ -181,14 +188,17 @@ fn check_out_level(
             submodule.released_url.as_deref(),
         )?;
     }
+    // Optional all the way down: whatever fails below one only warns.
     for submodule in &optional {
-        match check_out_submodule(release, submodule) {
-            Ok(()) => check_out_level(
+        let checked_out = check_out_submodule(release, submodule).and_then(|()| {
+            check_out_level(
                 &release.join(submodule.path),
                 None,
                 submodule.released_url.as_deref(),
-            )?,
-            Err(error) => warn!("{error:?}"),
+            )
+        });
+        if let Err(error) = checked_out {
+            warn!("{error:?}");
         }
     }
     Ok(())
@@ -249,17 +259,34 @@ fn update(repo: &Utf8Path, submodule: &Selected<'_>, source: &Source) -> anyhow:
         "--",
     ]);
     command.arg(submodule.path);
-    // A URL can carry a token in its path or query, which only it reveals.
-    let urls = match source {
+    // A URL can carry a token in its path or query, which only it reveals,
+    // and git reports it as an `insteadOf` rule rewrote it.
+    let withheld = || match source {
         Source::WorkingCopy(_) => Vec::new(),
-        Source::Url(url) => vec![url.as_str()],
+        Source::Url(url) => std::iter::once(url.clone())
+            .chain(rewritten(repo, url).filter(|rewritten| rewritten != url))
+            .collect(),
     };
     run_with(
         command,
         &format!("git submodule update of {}", submodule.path),
-        &urls,
+        withheld,
     )
     .map(drop)
+}
+
+/// `url` as git's `url.<base>.insteadOf` rules rewrite it, when git can tell.
+fn rewritten(repo: &Utf8Path, url: &str) -> Option<String> {
+    let mut command = git(repo);
+    command.args(["ls-remote", "--get-url", "--", url]);
+    match run(command, "git ls-remote --get-url") {
+        Ok(rewritten) => Some(rewritten.trim_end_matches('\n').to_owned()),
+        // The URL as given is withheld regardless.
+        Err(error) => {
+            debug!("{error:#}");
+            None
+        }
+    }
 }
 
 /// Remove what a failed checkout of `submodule` left in `repo`, so the next
@@ -555,19 +582,24 @@ fn stderr(output: &std::process::Output, urls: &[&str]) -> String {
 /// and carry git's message with the credentials of the URLs it names
 /// removed.
 fn run(command: Command, description: &str) -> anyhow::Result<String> {
-    run_with(command, description, &[])
+    run_with(command, description, Vec::new)
 }
 
-/// [`run`] a command given `urls`, which its errors withhold wholly.
-fn run_with(mut command: Command, description: &str, urls: &[&str]) -> anyhow::Result<String> {
+/// [`run`] a command given URLs, which its errors withhold wholly: `urls`
+/// lists them, called only once the command failed.
+fn run_with(
+    mut command: Command,
+    description: &str,
+    urls: impl FnOnce() -> Vec<String>,
+) -> anyhow::Result<String> {
     let output = command
         .output()
         .with_context(|| format!("cannot run {description}"))?;
-    anyhow::ensure!(
-        output.status.success(),
-        "{description} failed: {}",
-        stderr(&output, urls)
-    );
+    if !output.status.success() {
+        let urls = urls();
+        let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+        anyhow::bail!("{description} failed: {}", stderr(&output, &urls));
+    }
     String::from_utf8(output.stdout).with_context(|| format!("non-UTF-8 output of {description}"))
 }
 

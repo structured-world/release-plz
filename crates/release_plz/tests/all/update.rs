@@ -1607,6 +1607,60 @@ fn git_only_update_reconstructs_submodules_whose_url_is_overridden() {
     assert_git_only_patch_release(&temp_dir, &repo);
 }
 
+/// The checkout of a repository the working copy overrides a submodule's URL
+/// with says nothing about the released repository's nested submodules: one
+/// the release needs is fetched although the override leaves its namesake
+/// uninitialized.
+#[test]
+fn git_only_update_reconstructs_nested_submodules_under_an_overridden_url() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let inner_dir = temp_dir.path().join("inner");
+    crate_repo(&inner_dir, "inner", "");
+    let old = crate_repo(
+        &temp_dir.path().join("old"),
+        "dep",
+        "[dependencies]\ninner = { path = \"inner\" }\n",
+    );
+    add_submodule(&old, &inner_dir, "inner");
+    old.add_all_and_commit("add inner").unwrap();
+    let new = crate_repo(&temp_dir.path().join("new"), "dep", "");
+    add_submodule(&new, &inner_dir, "inner");
+    new.add_all_and_commit("add inner").unwrap();
+
+    let repo = git_only_app(temp_dir.path(), "dep = { path = \"vendor/dep\" }");
+    add_submodule(&repo, old.directory(), "vendor/dep");
+    repo.git(&[
+        ALLOW_FILE[0],
+        ALLOW_FILE[1],
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+    ])
+    .unwrap();
+    generate_lockfile(repo.directory());
+    repo.add_all_and_commit("chore: add dep").unwrap();
+    repo.tag_lightweight("v0.1.0").unwrap();
+
+    repo.git(&["submodule", "deinit", "-f", "vendor/dep"])
+        .unwrap();
+    fs_err::remove_dir_all(repo.directory().join(".git/modules/vendor")).unwrap();
+    repo.git(&[
+        "config",
+        "submodule.vendor/dep.url",
+        new.directory().as_str(),
+    ])
+    .unwrap();
+    git_cmd::git_in_dir(
+        repo.directory(),
+        &["clone", "-q", new.directory().as_str(), "vendor/dep"],
+    )
+    .unwrap();
+    change_app(&repo);
+
+    assert_git_only_patch_release(&temp_dir, &repo);
+}
+
 /// Of two submodules of the release with one URL, the one removed since is
 /// not mistaken for the other, which the working copy leaves uninitialized:
 /// it is still fetched, as the release needs it.
@@ -1701,6 +1755,108 @@ fn git_only_update_anchors_urls_relative_to_a_relative_remote() {
     repo.git(&["config", "--remove-section", "submodule.vendor/dep"])
         .unwrap();
     fs_err::remove_dir_all(dir.join(".git/modules/vendor")).unwrap();
+    fs_err::write(dir.join("app/src/lib.rs"), "// Fixed\n").unwrap();
+    repo.add_all_and_commit("fix: update app").unwrap();
+
+    assert_git_only_patch_release_of(&temp_dir, &repo, "app/Cargo.toml");
+}
+
+/// Git reports the URL an `insteadOf` rule rewrote a submodule URL to, which
+/// can carry a token of its own: the warning about an unreachable submodule
+/// withholds it.
+#[test]
+fn git_only_update_withholds_urls_rewritten_by_git() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let extra_dir = temp_dir.path().join("extra");
+    crate_repo(&extra_dir, "extra", "");
+    let dir = released_with_member_b(temp_dir.path(), "../vendor/dep");
+    let repo = Repo::init(&dir);
+    let dep = crate_repo(&temp_dir.path().join("dep"), "dep", "");
+    add_submodule(&repo, dep.directory(), "vendor/dep");
+    add_submodule(&repo, &extra_dir, "extra");
+    repo.git(&[
+        "submodule",
+        "set-url",
+        "extra",
+        "https://alias.invalid/extra",
+    ])
+    .unwrap();
+    generate_lockfile(&dir);
+    repo.add_all_and_commit("chore: add submodules").unwrap();
+    repo.tag_lightweight("app-v0.1.0").unwrap();
+    repo.tag_lightweight("b-v0.1.0").unwrap();
+
+    repo.git(&["rm", "extra"]).unwrap();
+    repo.add_all_and_commit("chore: remove extra").unwrap();
+    // As in a fresh clone, which has no trace of the removed submodule.
+    repo.git(&["config", "--remove-section", "submodule.extra"])
+        .unwrap();
+    fs_err::remove_dir_all(dir.join(".git/modules/extra")).unwrap();
+    fs_err::write(dir.join("app/src/lib.rs"), "// Fixed\n").unwrap();
+    repo.add_all_and_commit("fix: update app").unwrap();
+
+    let output = release_plz_cmd(&temp_dir.path().join("target"))
+        .current_dir(repo.directory())
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "protocol.file.allow")
+        .env("GIT_CONFIG_VALUE_0", "always")
+        .env(
+            "GIT_CONFIG_KEY_1",
+            "url.https://host.invalid/PATHSECRET/.insteadOf",
+        )
+        .env("GIT_CONFIG_VALUE_1", "https://alias.invalid/")
+        .arg("update")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let logs = String::from_utf8(output.stderr).unwrap();
+    assert!(logs.contains("cannot check out submodule extra"), "{logs}");
+    assert!(!logs.contains("PATHSECRET"), "{logs}");
+}
+
+/// A submodule removed after the release that nothing needs is optional all
+/// the way down: one whose own submodule's URL cannot be resolved only warns.
+#[test]
+fn git_only_update_tolerates_unresolvable_nested_urls_of_removed_submodules() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let extra_dir = temp_dir.path().join("extra");
+    let extra = crate_repo(&extra_dir, "extra", "");
+    // Climbs above the root of the URL `extra` is fetched from.
+    let unresolvable = format!("{}inner", "../".repeat(64));
+    fs_err::write(
+        extra_dir.join(".gitmodules"),
+        format!("[submodule \"inner\"]\n\tpath = inner\n\turl = {unresolvable}\n"),
+    )
+    .unwrap();
+    let head = extra.git(&["rev-parse", "HEAD"]).unwrap();
+    // An uninitialized submodule's directory, which keeps its gitlink staged.
+    fs_err::create_dir(extra_dir.join("inner")).unwrap();
+    extra
+        .git(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{},inner", head.trim()),
+        ])
+        .unwrap();
+    extra.add_all_and_commit("add inner").unwrap();
+    let dir = released_with_member_b(temp_dir.path(), "../vendor/dep");
+    let repo = Repo::init(&dir);
+    let dep = crate_repo(&temp_dir.path().join("dep"), "dep", "");
+    add_submodule(&repo, dep.directory(), "vendor/dep");
+    add_submodule(&repo, &extra_dir, "extra");
+    generate_lockfile(&dir);
+    repo.add_all_and_commit("chore: add submodules").unwrap();
+    repo.tag_lightweight("app-v0.1.0").unwrap();
+    repo.tag_lightweight("b-v0.1.0").unwrap();
+
+    repo.git(&["rm", "extra"]).unwrap();
+    repo.add_all_and_commit("chore: remove extra").unwrap();
+    // As in a fresh clone, which has no trace of the removed submodule.
+    repo.git(&["config", "--remove-section", "submodule.extra"])
+        .unwrap();
+    fs_err::remove_dir_all(dir.join(".git/modules/extra")).unwrap();
     fs_err::write(dir.join("app/src/lib.rs"), "// Fixed\n").unwrap();
     repo.add_all_and_commit("fix: update app").unwrap();
 
