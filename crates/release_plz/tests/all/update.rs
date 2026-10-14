@@ -1,4 +1,4 @@
-use cargo_metadata::camino::Utf8Path;
+use cargo_metadata::camino::{Utf8Path, Utf8PathBuf};
 use git_cmd::Repo;
 use release_plz_core::fs_utils::Utf8TempDir;
 
@@ -1571,6 +1571,182 @@ fn git_only_update_resolves_nested_urls_against_the_released_repository() {
     change_app(&repo);
 
     assert_git_only_patch_release(&temp_dir, &repo);
+}
+
+/// A submodule whose URL the working copy overrides locally with an
+/// unrelated repository, its checkout cloned from there, is still fetched
+/// from the URL the release records.
+#[test]
+fn git_only_update_reconstructs_submodules_whose_url_is_overridden() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let old = crate_repo(&temp_dir.path().join("old"), "dep", "");
+    let repo = git_only_app(temp_dir.path(), "dep = { path = \"vendor/dep\" }");
+    add_submodule(&repo, old.directory(), "vendor/dep");
+    generate_lockfile(repo.directory());
+    repo.add_all_and_commit("chore: add dep").unwrap();
+    repo.tag_lightweight("v0.1.0").unwrap();
+
+    // An unrelated history: it lacks the released commit.
+    let new = crate_repo(&temp_dir.path().join("new"), "dep", "");
+    repo.git(&["submodule", "deinit", "-f", "vendor/dep"])
+        .unwrap();
+    fs_err::remove_dir_all(repo.directory().join(".git/modules/vendor")).unwrap();
+    repo.git(&[
+        "config",
+        "submodule.vendor/dep.url",
+        new.directory().as_str(),
+    ])
+    .unwrap();
+    git_cmd::git_in_dir(
+        repo.directory(),
+        &["clone", "-q", new.directory().as_str(), "vendor/dep"],
+    )
+    .unwrap();
+    change_app(&repo);
+
+    assert_git_only_patch_release(&temp_dir, &repo);
+}
+
+/// Of two submodules of the release with one URL, the one removed since is
+/// not mistaken for the other, which the working copy leaves uninitialized:
+/// it is still fetched, as the release needs it.
+#[test]
+fn git_only_update_tells_apart_submodules_sharing_a_url() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let dep = crate_repo(&temp_dir.path().join("dep"), "dep", "");
+    let dir = released_with_member_b(temp_dir.path(), "../vendor/a");
+    let repo = Repo::init(&dir);
+    add_submodule(&repo, dep.directory(), "vendor/a");
+    add_submodule(&repo, dep.directory(), "vendor/b");
+    generate_lockfile(&dir);
+    repo.add_all_and_commit("chore: add dep twice").unwrap();
+    repo.tag_lightweight("app-v0.1.0").unwrap();
+    repo.tag_lightweight("b-v0.1.0").unwrap();
+
+    repo.git(&["rm", "vendor/a"]).unwrap();
+    drop_dependencies_of_b(&dir);
+    repo.add_all_and_commit("fix: drop vendor/a").unwrap();
+    // As in a fresh clone, which has no trace of the removed submodule, and
+    // leaves the other uninitialized.
+    repo.git(&["config", "--remove-section", "submodule.vendor/a"])
+        .unwrap();
+    repo.git(&["submodule", "deinit", "-f", "vendor/b"])
+        .unwrap();
+    fs_err::remove_dir_all(dir.join(".git/modules/vendor")).unwrap();
+    fs_err::write(dir.join("app/src/lib.rs"), "// Fixed\n").unwrap();
+    repo.add_all_and_commit("fix: update app").unwrap();
+
+    assert_git_only_patch_release_of(&temp_dir, &repo, "app/Cargo.toml");
+}
+
+/// A `.gitmodules` section left behind once its gitlink was removed is not a
+/// submodule of the working copy: the release's submodule of that name is
+/// fetched as one removed since.
+#[test]
+fn git_only_update_ignores_sections_without_a_gitlink() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let dep = crate_repo(&temp_dir.path().join("dep"), "dep", "");
+    let dir = released_with_member_b(temp_dir.path(), "../vendor/dep");
+    let repo = Repo::init(&dir);
+    add_submodule(&repo, dep.directory(), "vendor/dep");
+    generate_lockfile(&dir);
+    repo.add_all_and_commit("chore: add dep").unwrap();
+    repo.tag_lightweight("app-v0.1.0").unwrap();
+    repo.tag_lightweight("b-v0.1.0").unwrap();
+
+    repo.git(&["rm", "--cached", "-q", "vendor/dep"]).unwrap();
+    fs_err::remove_dir_all(dir.join("vendor/dep")).unwrap();
+    drop_dependencies_of_b(&dir);
+    repo.add_all_and_commit("fix: drop dep, not its section")
+        .unwrap();
+    // As in a fresh clone, which has no trace of the removed submodule.
+    repo.git(&["config", "--remove-section", "submodule.vendor/dep"])
+        .unwrap();
+    fs_err::remove_dir_all(dir.join(".git/modules/vendor")).unwrap();
+    fs_err::write(dir.join("app/src/lib.rs"), "// Fixed\n").unwrap();
+    repo.add_all_and_commit("fix: update app").unwrap();
+
+    assert_git_only_patch_release_of(&temp_dir, &repo, "app/Cargo.toml");
+}
+
+/// A relative submodule URL resolved against a remote that is itself a
+/// relative path names a repository relative to the working copy, not to the
+/// worktree the release is checked out in.
+#[test]
+fn git_only_update_anchors_urls_relative_to_a_relative_remote() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    crate_repo(&temp_dir.path().join("remotes/dep"), "dep", "");
+    let dir = released_with_member_b(temp_dir.path(), "../vendor/dep");
+    let repo = Repo::init(&dir);
+    repo.git(&["remote", "add", "origin", "../remotes/project"])
+        .unwrap();
+    repo.git(&[
+        ALLOW_FILE[0],
+        ALLOW_FILE[1],
+        "submodule",
+        "add",
+        "../dep",
+        "vendor/dep",
+    ])
+    .unwrap();
+    generate_lockfile(&dir);
+    repo.add_all_and_commit("chore: add dep").unwrap();
+    repo.tag_lightweight("app-v0.1.0").unwrap();
+    repo.tag_lightweight("b-v0.1.0").unwrap();
+
+    repo.git(&["rm", "vendor/dep"]).unwrap();
+    drop_dependencies_of_b(&dir);
+    repo.add_all_and_commit("fix: drop dep").unwrap();
+    // As in a fresh clone, which has no trace of the removed submodule.
+    repo.git(&["config", "--remove-section", "submodule.vendor/dep"])
+        .unwrap();
+    fs_err::remove_dir_all(dir.join(".git/modules/vendor")).unwrap();
+    fs_err::write(dir.join("app/src/lib.rs"), "// Fixed\n").unwrap();
+    repo.add_all_and_commit("fix: update app").unwrap();
+
+    assert_git_only_patch_release_of(&temp_dir, &repo, "app/Cargo.toml");
+}
+
+/// A `git_only` workspace in `<parent>/project` with members `app` and `b`,
+/// `b` depending on the crate at `dependency`, and `vendor` excluded.
+fn released_with_member_b(parent: &Utf8Path, dependency: &str) -> Utf8PathBuf {
+    let dir = parent.join("project");
+    for (member, dependencies) in [
+        ("app", String::new()),
+        ("b", format!("dep = {{ path = \"{dependency}\" }}")),
+    ] {
+        fs_err::create_dir_all(dir.join(member).join("src")).unwrap();
+        fs_err::write(
+            dir.join(member).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+                 publish = false\n\n[dependencies]\n{dependencies}\n"
+            ),
+        )
+        .unwrap();
+        fs_err::write(dir.join(member).join("src/lib.rs"), "// Initial release\n").unwrap();
+    }
+    fs_err::write(
+        dir.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"b\"]\nexclude = [\"vendor\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    fs_err::write(
+        dir.join("release-plz.toml"),
+        "[workspace]\ngit_only = true\npublish = false\nsemver_check = false\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// Member `b` of [`released_with_member_b`] no longer depends on anything.
+fn drop_dependencies_of_b(dir: &Utf8Path) {
+    fs_err::write(
+        dir.join("b/Cargo.toml"),
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n",
+    )
+    .unwrap();
+    generate_lockfile(dir);
 }
 
 /// Git configuration for the submodules of these tests, whose URLs are local

@@ -85,7 +85,7 @@ fn check_out_level(
     // A checkout cloned from the working copy has that copy as its remote,
     // so without a counterpart the URL the release records stands in.
     let base = match (working_copy, released_url) {
-        (Some(dir), _) => remote_url(dir)?,
+        (Some(dir), _) => anchored(dir, remote_url(dir)?),
         (None, Some(url)) => url.to_owned(),
         (None, None) => remote_url(release)?,
     };
@@ -118,14 +118,22 @@ fn check_out_level(
             released_url,
         };
         // Matched by name; a section renamed since is the same submodule when
-        // it has the same URL, preferably at the same path, or else when it is
-        // at the same path.
+        // it alone has the same URL, preferably at the same path, or else
+        // alone is at the same path. A section whose name the release
+        // declares is that submodule, not this one renamed.
         let matched = current.get(name.as_str()).or_else(|| {
-            let values = || current.values();
-            values()
-                .find(|(c, _)| c.url.as_ref() == Some(released_url) && c.path == submodule.path)
-                .or_else(|| values().find(|(c, _)| c.url.as_ref() == Some(released_url)))
-                .or_else(|| values().find(|(c, _)| c.path == submodule.path))
+            let renamed = || {
+                current
+                    .iter()
+                    .filter(|(name, _)| !declared.contains_key(*name))
+                    .map(|(_, section)| section)
+            };
+            let same_url =
+                |(c, _): &&(Declared, Option<String>)| c.url.as_ref() == Some(released_url);
+            let same_path = |(c, _): &&(Declared, Option<String>)| c.path == submodule.path;
+            only(renamed().filter(|c| same_url(c) && same_path(c)))
+                .or_else(|| only(renamed().filter(same_url)))
+                .or_else(|| only(renamed().filter(same_path)))
         });
         let Some((current, configured)) = matched else {
             let released = released()?;
@@ -145,12 +153,14 @@ fn check_out_level(
         };
         if current.url.as_ref() == Some(released_url) {
             // The working copy can lack the released commit, e.g. in a shallow
-            // checkout; its configured URL can then still have it.
-            let remote = match configured {
-                Some(url) => url.clone(),
-                None => released()?,
-            };
-            let sources = vec![Source::WorkingCopy(checkout.clone()), Source::Url(remote)];
+            // checkout; its configured URL can then still have it, and when
+            // that overrides the recorded one, the recorded one can.
+            let released = released()?;
+            let mut sources = vec![Source::WorkingCopy(checkout.clone())];
+            if let Some(url) = configured.as_ref().filter(|url| **url != released) {
+                sources.push(Source::Url(url.clone()));
+            }
+            sources.push(Source::Url(released));
             required.push(selected(sources, Some(checkout), None));
         } else {
             // Another URL: a mirror of the same history, whose checkout can have
@@ -335,18 +345,28 @@ fn declared(gitmodules: &Utf8Path) -> anyhow::Result<BTreeMap<String, Declared>>
     Ok(declared)
 }
 
-/// The submodules the repository at `dir` declares, each with the URL its
-/// configuration holds for it.
+/// The submodules the repository at `dir` declares and has a gitlink for,
+/// each with the URL its configuration holds for it.
 fn declared_with_config(
     dir: &Utf8Path,
 ) -> anyhow::Result<BTreeMap<String, (Declared, Option<String>)>> {
+    let gitlinks = gitlinks(dir)?;
     declared(&dir.join(".gitmodules"))?
         .into_iter()
+        // A section left behind by a removed gitlink is not a submodule.
+        .filter(|(_, submodule)| gitlinks.contains(&submodule.path))
         .map(|(name, submodule)| {
-            let configured = config(dir, &format!("submodule.{name}.url"))?;
+            let configured = config(dir, &format!("submodule.{name}.url"))?
+                .map(|url| anchored(dir, url));
             Ok((name, (submodule, configured)))
         })
         .collect()
+}
+
+/// The only item of `items`, if there is exactly one.
+fn only<T>(mut items: impl Iterator<Item = T>) -> Option<T> {
+    let item = items.next()?;
+    items.next().is_none().then_some(item)
 }
 
 /// Paths of the gitlinks of the index of `repo`.
@@ -421,6 +441,17 @@ fn resolve_url(remote: &str, url: &str) -> anyhow::Result<String> {
         .map_or_else(|| resolved.clone(), str::to_owned))
 }
 
+/// `url`, read from the configuration of the repository at `dir`, usable from
+/// any directory: git reads a relative local path from the repository's
+/// directory, and the release is checked out elsewhere.
+fn anchored(dir: &Utf8Path, url: String) -> String {
+    if is_local_not_ssh(&url) && Utf8Path::new(&url).is_relative() {
+        dir.join(url).into_string()
+    } else {
+        url
+    }
+}
+
 /// Whether `url` is a local path rather than a URL or an scp-like address.
 fn is_local_not_ssh(url: &str) -> bool {
     match url.find(':') {
@@ -477,7 +508,8 @@ fn without_userinfo(url: &str) -> Option<String> {
 /// the userinfo and query of any other `scheme://` URL.
 fn redact(text: &str, urls: &[&str]) -> String {
     let mut text = text.to_owned();
-    for url in urls.iter().filter(|url| url.contains("://")) {
+    // Any form git takes, scp-like ones included, which it repeats verbatim.
+    for url in urls.iter().filter(|url| !url.is_empty()) {
         for form in std::iter::once((*url).to_owned()).chain(without_userinfo(url)) {
             text = text.replace(&form, "<submodule URL>");
         }
@@ -692,6 +724,28 @@ mod tests {
         }
     }
 
+    /// Git repeats an scp-like URL verbatim, so one given to it is withheld
+    /// as well, its user and path being able to carry a token.
+    #[test]
+    fn scp_like_urls_given_to_git_are_withheld() {
+        let url = "t0ken@host:SECRET/dep.git";
+        let redacted = redact(
+            "fatal: 't0ken@host:SECRET/dep.git' does not appear to be a git repository",
+            &[url],
+        );
+        assert_eq!(
+            redacted,
+            "fatal: '<submodule URL>' does not appear to be a git repository"
+        );
+    }
+
+    /// An empty URL given to git withholds nothing, rather than matching
+    /// everywhere.
+    #[test]
+    fn an_empty_url_given_to_git_withholds_nothing() {
+        assert_eq!(redact("fatal: no", &[""]), "fatal: no");
+    }
+
     /// A name with a `..` component, which git refuses, names a directory
     /// outside the repository's metadata: the checkout skips it and removes
     /// nothing there.
@@ -699,9 +753,11 @@ mod tests {
     fn a_name_climbing_out_of_the_metadata_removes_nothing() {
         let dir = crate::fs_utils::Utf8TempDir::new().unwrap();
         let git_ok = |repo: &Utf8Path, args: &[&str]| {
+            // The identity is set here: a runner has no global one.
             let mut command = git(repo);
             command
                 .args(["-c", "protocol.file.allow=always"])
+                .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
                 .args(args);
             run(command, "git").unwrap();
         };
