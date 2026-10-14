@@ -43,6 +43,7 @@
         "dependencies_update": null,
         "features_always_increment_minor": null,
         "git_only": null,
+        "git_only_submodules": null,
         "git_release_body": null,
         "git_release_draft": null,
         "git_release_enable": null,
@@ -248,6 +249,28 @@
           ]
         }
       }
+    },
+    "GitOnlySubmodules": {
+      "oneOf": [
+        {
+          "title": "None",
+          "description": "Check out no submodule: their directories stay empty.",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "title": "Initialized",
+          "description": "Check out the submodules initialized in the working copy, at every\nlevel, and those it no longer declares or fetches from another URL.",
+          "type": "string",
+          "const": "initialized"
+        },
+        {
+          "title": "All",
+          "description": "Also try the submodules the working copy leaves uninitialized, at\nevery level.",
+          "type": "string",
+          "const": "all"
+        }
+      ]
     },
     "LinkParser": {
       "type": "object",
@@ -617,6 +640,18 @@
           "type": [
             "boolean",
             "null"
+          ]
+        },
+        "git_only_submodules": {
+          "title": "Git Only Submodules",
+          "description": "Which submodules a release is reconstructed with in `git_only` mode:\n`none`, `initialized` (those initialized in the working copy) or `all`.\nDefaults to `initialized`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GitOnlySubmodules"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "git_release_body": {

@@ -172,6 +172,11 @@ pub struct Workspace {
     /// - If `true`, update all the dependencies in the Cargo.lock file by running `cargo update`.
     /// - If `false` or [`Option::None`], only update the workspace packages by running `cargo update --workspace`.
     pub dependencies_update: Option<bool>,
+    /// # Git Only Submodules
+    /// Which submodules a release is reconstructed with in `git_only` mode:
+    /// `none`, `initialized` (those initialized in the working copy) or `all`.
+    /// Defaults to `initialized`.
+    pub git_only_submodules: Option<GitOnlySubmodules>,
     /// # PR Name
     /// Tera template of the pull request's name created by release-plz.
     pub pr_name: Option<String>,
@@ -224,6 +229,7 @@ impl Default for Workspace {
             allow_dirty: None,
             changelog_config: None,
             dependencies_update: None,
+            git_only_submodules: None,
             repo_url: None,
             pr_name: None,
             pr_body: None,
@@ -577,6 +583,33 @@ impl From<ReleaseType> for release_plz_core::ReleaseType {
     }
 }
 
+#[derive(Serialize, Deserialize, Default, PartialEq, Eq, Debug, Clone, Copy, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GitOnlySubmodules {
+    /// # None
+    /// Check out no submodule: their directories stay empty.
+    None,
+    /// # Initialized
+    /// Check out the submodules initialized in the working copy, at every
+    /// level, and those it no longer declares or fetches from another URL.
+    #[default]
+    Initialized,
+    /// # All
+    /// Also try the submodules the working copy leaves uninitialized, at
+    /// every level.
+    All,
+}
+
+impl From<GitOnlySubmodules> for release_plz_core::SubmoduleCheckout {
+    fn from(value: GitOnlySubmodules) -> Self {
+        match value {
+            GitOnlySubmodules::None => Self::None,
+            GitOnlySubmodules::Initialized => Self::Initialized,
+            GitOnlySubmodules::All => Self::All,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,6 +673,7 @@ mod tests {
             changelog: ChangelogCfg::default(),
             workspace: Workspace {
                 dependencies_update: Some(false),
+                git_only_submodules: None,
                 changelog_config: Some("../git-cliff.toml".into()),
                 allow_dirty: Some(false),
                 repo_url: Some(
@@ -763,6 +797,7 @@ mod tests {
             changelog: ChangelogCfg::default(),
             workspace: Workspace {
                 dependencies_update: None,
+                git_only_submodules: None,
                 changelog_config: Some("../git-cliff.toml".into()),
                 allow_dirty: None,
                 repo_url: Some(

@@ -8,6 +8,20 @@ use anyhow::Context;
 use cargo_metadata::camino::{Utf8Path, Utf8PathBuf};
 use tracing::{debug, warn};
 
+/// Which submodules of a release are checked out where it is reconstructed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SubmoduleCheckout {
+    /// None: every submodule directory stays empty.
+    None,
+    /// Those the working copy has initialized, at every level, and those it
+    /// no longer declares or fetches from elsewhere.
+    #[default]
+    Initialized,
+    /// Every submodule, at every level: those the working copy leaves
+    /// uninitialized are tried as well.
+    All,
+}
+
 /// A submodule as a `.gitmodules` file declares it, keyed by its name.
 struct Declared {
     path: String,
@@ -57,11 +71,19 @@ struct Selected<'a> {
 /// checkout first, in case that is a mirror), are tried, as only the release
 /// knows whether it needs them: failing to fetch one only warns, since a
 /// release that needs it fails later with Cargo's error anyway. Those the
-/// working copy declares but leaves uninitialized stay so. Nested submodules
-/// follow the same rules against the working copy's checkout of the same
+/// working copy declares but leaves uninitialized stay so, unless `mode` is
+/// [`SubmoduleCheckout::All`], which tries them too. Nested submodules follow
+/// the same rules against the working copy's checkout of the same
 /// repository. No git configuration is written.
-pub(crate) fn check_out(release: &Utf8Path, working_copy: &Utf8Path) -> anyhow::Result<()> {
-    check_out_level(release, Some(working_copy), None)
+pub(crate) fn check_out(
+    release: &Utf8Path,
+    working_copy: &Utf8Path,
+    mode: SubmoduleCheckout,
+) -> anyhow::Result<()> {
+    if mode == SubmoduleCheckout::None {
+        return Ok(());
+    }
+    check_out_level(release, Some(working_copy), None, mode)
 }
 
 /// One level of [`check_out`]: `working_copy` is the working copy's checkout
@@ -71,6 +93,7 @@ fn check_out_level(
     release: &Utf8Path,
     working_copy: Option<&Utf8Path>,
     released_url: Option<&str>,
+    mode: SubmoduleCheckout,
 ) -> anyhow::Result<()> {
     let declared = declared(&release.join(".gitmodules"))?;
     if declared.is_empty() {
@@ -150,8 +173,16 @@ fn check_out_level(
         else {
             // Declared and left uninitialized: the user's choice of what is
             // fetched, as `git submodule update` without `--init` leaves it.
-            // Fetching it anyway would cost every comparison a download that
-            // can be large or need credentials the run lacks.
+            // Fetching it anyway costs every comparison a download that can be
+            // large or need credentials the run lacks, so only `All` tries it.
+            if mode == SubmoduleCheckout::All {
+                let released = released()?;
+                optional.push(selected(
+                    vec![Source::Url(released.clone())],
+                    None,
+                    Some(released),
+                ));
+            }
             continue;
         };
         if current.url.as_ref() == Some(released_url) {
@@ -189,6 +220,7 @@ fn check_out_level(
             &release.join(submodule.path),
             submodule.counterpart.as_deref(),
             submodule.released_url.as_deref(),
+            mode,
         )?;
     }
     // Optional all the way down: whatever fails below one only warns.
@@ -198,6 +230,7 @@ fn check_out_level(
                 &release.join(submodule.path),
                 None,
                 submodule.released_url.as_deref(),
+                mode,
             )
         });
         if let Err(error) = checked_out {
@@ -832,7 +865,7 @@ mod tests {
             &["worktree", "add", "-q", "--detach", release.as_str()],
         );
 
-        check_out(&release, &superproject).unwrap();
+        check_out(&release, &superproject, SubmoduleCheckout::Initialized).unwrap();
         assert!(victim.join("keep").exists(), "removed outside the metadata");
     }
 

@@ -1863,6 +1863,70 @@ fn git_only_update_tolerates_unresolvable_nested_urls_of_removed_submodules() {
     assert_git_only_patch_release_of(&temp_dir, &repo, "app/Cargo.toml");
 }
 
+/// With `git_only_submodules = "all"`, a submodule the working copy declares
+/// but leaves uninitialized, which only the released manifest needs, is
+/// checked out in the release.
+#[test]
+fn git_only_update_with_all_submodules_reconstructs_uninitialized_ones() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let dep = crate_repo(&temp_dir.path().join("dep"), "dep", "");
+    let dir = released_with_member_b(temp_dir.path(), "../vendor/dep");
+    fs_err::write(
+        dir.join("release-plz.toml"),
+        "[workspace]\ngit_only = true\npublish = false\nsemver_check = false\n\
+         git_only_submodules = \"all\"\n",
+    )
+    .unwrap();
+    let repo = Repo::init(&dir);
+    add_submodule(&repo, dep.directory(), "vendor/dep");
+    generate_lockfile(&dir);
+    repo.add_all_and_commit("chore: add dep").unwrap();
+    repo.tag_lightweight("app-v0.1.0").unwrap();
+    repo.tag_lightweight("b-v0.1.0").unwrap();
+
+    drop_dependencies_of_b(&dir);
+    repo.add_all_and_commit("fix: b no longer needs dep")
+        .unwrap();
+    // Still declared, no longer initialized.
+    repo.git(&["submodule", "deinit", "-f", "vendor/dep"])
+        .unwrap();
+    fs_err::remove_dir_all(dir.join(".git/modules/vendor")).unwrap();
+    fs_err::write(dir.join("app/src/lib.rs"), "// Fixed\n").unwrap();
+    repo.add_all_and_commit("fix: update app").unwrap();
+
+    assert_git_only_patch_release_of(&temp_dir, &repo, "app/Cargo.toml");
+}
+
+/// With `git_only_submodules = "none"`, no submodule is checked out, so a
+/// release depending on one cannot be packaged.
+#[test]
+fn git_only_update_with_no_submodules_leaves_them_empty() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let dep = crate_repo(&temp_dir.path().join("dep"), "dep", "");
+    let repo = git_only_app(temp_dir.path(), "dep = { path = \"vendor/dep\" }");
+    fs_err::write(
+        repo.directory().join("release-plz.toml"),
+        "[workspace]\ngit_only = true\npublish = false\nsemver_check = false\n\
+         git_only_submodules = \"none\"\n",
+    )
+    .unwrap();
+    add_submodule(&repo, dep.directory(), "vendor/dep");
+    release_then_fix(&repo);
+
+    let output = release_plz_cmd(&temp_dir.path().join("target"))
+        .current_dir(repo.directory())
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "protocol.file.allow")
+        .env("GIT_CONFIG_VALUE_0", "always")
+        .arg("update")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let logs = String::from_utf8(output.stderr).unwrap();
+    assert!(logs.contains("vendor/dep"), "{logs}");
+}
+
 /// A `git_only` workspace in `<parent>/project` with members `app` and `b`,
 /// `b` depending on the crate at `dependency`, and `vendor` excluded.
 fn released_with_member_b(parent: &Utf8Path, dependency: &str) -> Utf8PathBuf {
