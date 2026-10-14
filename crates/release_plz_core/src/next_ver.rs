@@ -181,7 +181,11 @@ fn process_git_only_package(
                 .context("checkout release commit for package")?;
             // Path dependencies and package files can live in submodules, which the
             // worktree leaves empty.
-            submodules::check_out(to_utf8_path(worktree.path())?, working_copy_root)?;
+            submodules::check_out(
+                to_utf8_path(worktree.path())?,
+                working_copy_root,
+                input.submodule_checkout(),
+            )?;
 
             // Keep the original manifests and path dependencies. Creating archives would
             // require registry versions even for dependencies that will never be published.

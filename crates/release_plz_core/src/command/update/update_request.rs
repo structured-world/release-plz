@@ -11,7 +11,8 @@ use cargo_metadata::{
 use regex::Regex;
 
 use crate::{
-    ChangelogRequest, ForgeType, GitClient, GitForge, PackagePath as _, RepoUrl, fs_utils,
+    ChangelogRequest, ForgeType, GitClient, GitForge, PackagePath as _, RepoUrl, SubmoduleCheckout,
+    fs_utils,
 };
 
 use super::update_config::{PackageUpdateConfig, UpdateConfig};
@@ -40,6 +41,8 @@ pub struct UpdateRequest {
     /// Allow dirty working directories to be updated.
     /// The uncommitted changes will be part of the update.
     allow_dirty: bool,
+    /// Which submodules a release reconstructed in `git_only` mode checks out.
+    submodule_checkout: SubmoduleCheckout,
     /// Repository Url. If present, the new changelog entry contains a link to the diff between the old and new version.
     /// Format: `https://{repo_host}/{repo_owner}/{repo_name}/compare/{old_tag}...{new_tag}`.
     repo_url: Option<RepoUrl>,
@@ -67,6 +70,7 @@ impl UpdateRequest {
             registry: None,
             dependencies_update: false,
             allow_dirty: false,
+            submodule_checkout: SubmoduleCheckout::default(),
             repo_url: None,
             packages_config: PackagesConfig::default(),
             release_commits: None,
@@ -239,6 +243,17 @@ impl UpdateRequest {
 
     pub fn allow_dirty(&self) -> bool {
         self.allow_dirty
+    }
+
+    pub fn with_submodule_checkout(self, submodule_checkout: SubmoduleCheckout) -> Self {
+        Self {
+            submodule_checkout,
+            ..self
+        }
+    }
+
+    pub fn submodule_checkout(&self) -> SubmoduleCheckout {
+        self.submodule_checkout
     }
 
     pub fn repo_url(&self) -> Option<&RepoUrl> {

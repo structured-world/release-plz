@@ -176,7 +176,14 @@ impl Update {
             })?
             .with_dependencies_update(self.dependencies_update(config))
             .with_max_analyze_commits(self.max_analyze_commits(config))
-            .with_allow_dirty(self.allow_dirty(config));
+            .with_allow_dirty(self.allow_dirty(config))
+            .with_submodule_checkout(
+                config
+                    .workspace
+                    .git_only_submodules
+                    .unwrap_or_default()
+                    .into(),
+            );
         match self.get_repo_url(config) {
             Ok(repo_url) => {
                 update = update.with_repo_url(repo_url);
@@ -327,5 +334,34 @@ mod tests {
             .unwrap();
         let pkg_config = req.get_package_config("aaa");
         assert_eq!(pkg_config, release_plz_core::PackageUpdateConfig::default());
+    }
+
+    /// `git_only_submodules` reaches the request, `initialized` when unset.
+    #[test]
+    fn git_only_submodules_reach_the_request() {
+        use release_plz_core::SubmoduleCheckout;
+
+        for (workspace, expected) in [
+            ("", SubmoduleCheckout::Initialized),
+            ("git_only_submodules = \"none\"", SubmoduleCheckout::None),
+            (
+                "git_only_submodules = \"initialized\"",
+                SubmoduleCheckout::Initialized,
+            ),
+            ("git_only_submodules = \"all\"", SubmoduleCheckout::All),
+        ] {
+            let config: Config = toml::from_str(&format!("[workspace]\n{workspace}")).unwrap();
+            let req = default_args()
+                .update_request(&config, fake_metadata())
+                .unwrap();
+            assert_eq!(req.submodule_checkout(), expected, "{workspace}");
+        }
+    }
+
+    /// Only the three strategies are accepted.
+    #[test]
+    fn unknown_git_only_submodules_are_refused() {
+        let config = toml::from_str::<Config>("[workspace]\ngit_only_submodules = \"recursive\"");
+        assert!(config.is_err());
     }
 }

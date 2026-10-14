@@ -46,3 +46,4 @@ pub use package_path::*;
 pub use pr::{DEFAULT_BRANCH_PREFIX, Pr};
 pub use project::*;
 pub use repo_url::*;
+pub use submodules::SubmoduleCheckout;
