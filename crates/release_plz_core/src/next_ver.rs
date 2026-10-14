@@ -1,6 +1,7 @@
 use crate::command::git::{GitRepo, GitWorkTree};
 use crate::registry_packages::{PackagesCollection, RegistryPackage, ReleasedWorkspace};
 use crate::release_regex;
+use crate::submodules;
 use crate::tera::default_tag_name_template;
 use crate::tmp_repo::TempRepo;
 use crate::update_request::UpdateRequest;
@@ -127,6 +128,7 @@ fn process_git_only_package(
     input: &UpdateRequest,
     is_multi_package: bool,
     reconstructed_workspaces: &mut BTreeMap<String, ReconstructedWorkspace>,
+    working_copy_root: &Utf8Path,
 ) -> anyhow::Result<Option<RegistryPackage>> {
     // Get the release tag template, falling back to default based on project structure
     let template = input
@@ -177,6 +179,9 @@ fn process_git_only_package(
 
             repo.checkout_commit(&release_commit)
                 .context("checkout release commit for package")?;
+            // Path dependencies and package files can live in submodules, which the
+            // worktree leaves empty.
+            submodules::check_out(to_utf8_path(worktree.path())?, working_copy_root)?;
 
             // Keep the original manifests and path dependencies. Creating archives would
             // require registry versions even for dependencies that will never be published.
@@ -301,12 +306,12 @@ fn collect_git_only_packages(
     // reconstruction inputs (repository, manifest, Cargo config) are fixed for this invocation.
     let mut reconstructed_workspaces = BTreeMap::new();
 
-    let mut unreleased_project_repo = GitRepo::open(
-        input
-            .local_manifest_dir()
-            .context("get local manifest dir")?,
-    )
-    .context("create unreleased repo for spinning worktrees")?;
+    let local_manifest_dir = input
+        .local_manifest_dir()
+        .context("get local manifest dir")?;
+    let mut unreleased_project_repo = GitRepo::open(local_manifest_dir)
+        .context("create unreleased repo for spinning worktrees")?;
+    let working_copy_root = root_repo_path_from_manifest_dir(local_manifest_dir)?;
 
     for package in git_only_packages {
         if let Some(registry_package) = process_git_only_package(
@@ -315,6 +320,7 @@ fn collect_git_only_packages(
             input,
             is_multi_package,
             &mut reconstructed_workspaces,
+            &working_copy_root,
         )? {
             all_packages.insert(registry_package.package.name.to_string(), registry_package);
         }
