@@ -1897,34 +1897,44 @@ fn git_only_update_with_all_submodules_reconstructs_uninitialized_ones() {
     assert_git_only_patch_release_of(&temp_dir, &repo, "app/Cargo.toml");
 }
 
-/// With `git_only_submodules = "none"`, no submodule is checked out, so a
-/// release depending on one cannot be packaged.
+/// With `git_only_submodules = "none"`, no submodule is checked out: the
+/// reconstruction attempts none, where the default checks out the one the
+/// working copy has initialized.
 #[test]
-fn git_only_update_with_no_submodules_leaves_them_empty() {
-    let temp_dir = Utf8TempDir::new().unwrap();
-    let dep = crate_repo(&temp_dir.path().join("dep"), "dep", "");
-    let repo = git_only_app(temp_dir.path(), "dep = { path = \"vendor/dep\" }");
-    fs_err::write(
-        repo.directory().join("release-plz.toml"),
-        "[workspace]\ngit_only = true\npublish = false\nsemver_check = false\n\
-         git_only_submodules = \"none\"\n",
-    )
-    .unwrap();
-    add_submodule(&repo, dep.directory(), "vendor/dep");
-    release_then_fix(&repo);
+fn git_only_update_with_no_submodules_checks_out_none() {
+    for (strategy, checked_out) in [("none", false), ("initialized", true)] {
+        let temp_dir = Utf8TempDir::new().unwrap();
+        let dep = crate_repo(&temp_dir.path().join("dep"), "dep", "");
+        let repo = git_only_app(temp_dir.path(), "");
+        fs_err::write(
+            repo.directory().join("release-plz.toml"),
+            format!(
+                "[workspace]\ngit_only = true\npublish = false\nsemver_check = false\n\
+                 git_only_submodules = \"{strategy}\"\n"
+            ),
+        )
+        .unwrap();
+        add_submodule(&repo, dep.directory(), "vendor/dep");
+        release_then_fix(&repo);
 
-    let output = release_plz_cmd(&temp_dir.path().join("target"))
-        .current_dir(repo.directory())
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "protocol.file.allow")
-        .env("GIT_CONFIG_VALUE_0", "always")
-        .arg("update")
-        .assert()
-        .failure()
-        .get_output()
-        .clone();
-    let logs = String::from_utf8(output.stderr).unwrap();
-    assert!(logs.contains("vendor/dep"), "{logs}");
+        let output = release_plz_cmd(&temp_dir.path().join("target"))
+            .current_dir(repo.directory())
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "protocol.file.allow")
+            .env("GIT_CONFIG_VALUE_0", "always")
+            .env("RELEASE_PLZ_LOG", "release_plz_core=debug")
+            .arg("update")
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let logs = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(
+            logs.contains("checking out submodule vendor/dep"),
+            checked_out,
+            "{strategy}: {logs}"
+        );
+    }
 }
 
 /// A `git_only` workspace in `<parent>/project` with members `app` and `b`,
