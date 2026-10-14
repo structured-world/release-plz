@@ -148,7 +148,10 @@ fn check_out_level(
             .map(|dir| dir.join(&current.path))
             .filter(|dir| dir.join(".git").exists())
         else {
-            // Declared and left uninitialized: not needed.
+            // Declared and left uninitialized: the user's choice of what is
+            // fetched, as `git submodule update` without `--init` leaves it.
+            // Fetching it anyway would cost every comparison a download that
+            // can be large or need credentials the run lacks.
             continue;
         };
         if current.url.as_ref() == Some(released_url) {
@@ -247,6 +250,10 @@ fn update(repo: &Utf8Path, submodule: &Selected<'_>, source: &Source) -> anyhow:
             // A path to the user's own checkout, chosen here, not by `.gitmodules`.
             config.push(("protocol.file.allow", "always"));
         }
+        // Git's own transport policy applies: a local path or `file://` URL a
+        // `.gitmodules` names is refused unless the user allows it
+        // (`protocol.file.allow`, restricted since CVE-2022-39253), as the
+        // repository's content must not choose local repositories to clone.
         Source::Url(url) => config.push((url_key.as_str(), url)),
     }
     add_config(&mut command, &config)?;
