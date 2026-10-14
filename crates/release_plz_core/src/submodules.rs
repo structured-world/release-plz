@@ -132,7 +132,14 @@ fn check_out_level(
             warn!("submodule {name} of the release has no URL; it is not checked out");
             continue;
         };
-        let released = || resolve_url(&base, released_url);
+        // A relative URL can fail to resolve (one climbing above the remote).
+        // The submodule then has no URL source: one the working copy has
+        // checked out still comes from that checkout, any other only warns,
+        // as a failed fetch of an optional submodule does.
+        let resolved = resolve_url(&base, released_url);
+        let unresolved = |error: anyhow::Error| {
+            warn!("submodule {name} of the release is not checked out: {error:#}");
+        };
         let selected = |sources, counterpart, released_url| Selected {
             name,
             path: &submodule.path,
@@ -159,7 +166,13 @@ fn check_out_level(
                 .or_else(|| only(renamed().filter(same_path)))
         });
         let Some((current, configured)) = matched else {
-            let released = released()?;
+            let released = match resolved {
+                Ok(url) => url,
+                Err(error) => {
+                    unresolved(error);
+                    continue;
+                }
+            };
             optional.push(selected(
                 vec![Source::Url(released.clone())],
                 None,
@@ -176,12 +189,14 @@ fn check_out_level(
             // Fetching it anyway costs every comparison a download that can be
             // large or need credentials the run lacks, so only `All` tries it.
             if mode == SubmoduleCheckout::All {
-                let released = released()?;
-                optional.push(selected(
-                    vec![Source::Url(released.clone())],
-                    None,
-                    Some(released),
-                ));
+                match resolved {
+                    Ok(released) => optional.push(selected(
+                        vec![Source::Url(released.clone())],
+                        None,
+                        Some(released),
+                    )),
+                    Err(error) => unresolved(error),
+                }
             }
             continue;
         };
@@ -189,18 +204,22 @@ fn check_out_level(
             // The working copy can lack the released commit, e.g. in a shallow
             // checkout; its configured URL can then still have it, and when
             // that overrides the recorded one, the recorded one can.
-            let released = released()?;
-            let overridden = configured.as_ref().filter(|url| **url != released);
+            let released = resolved
+                .inspect_err(|error| debug!("submodule {name} of the release: {error:#}"))
+                .ok();
+            let overridden = configured
+                .as_ref()
+                .filter(|url| Some(*url) != released.as_ref());
             let mut sources = vec![Source::WorkingCopy(checkout.clone())];
             if let Some(url) = overridden {
                 sources.push(Source::Url(url.clone()));
             }
-            sources.push(Source::Url(released.clone()));
+            sources.extend(released.iter().cloned().map(Source::Url));
             // A checkout of the overriding repository, like one fetched from
             // another URL below, says nothing of the released nested state.
             let submodule = match overridden {
                 None => selected(sources, Some(checkout), None),
-                Some(_) => selected(sources, None, Some(released)),
+                Some(_) => selected(sources, None, released),
             };
             required.push(submodule);
         } else {
@@ -208,9 +227,12 @@ fn check_out_level(
             // the released commit, or a replacement. Having the commit does not
             // tell them apart (a checkout fetched from the new repository keeps
             // the old objects), so its nested state does not apply either way.
-            let released = released()?;
-            let sources = vec![Source::WorkingCopy(checkout), Source::Url(released.clone())];
-            optional.push(selected(sources, None, Some(released)));
+            let released = resolved
+                .inspect_err(|error| debug!("submodule {name} of the release: {error:#}"))
+                .ok();
+            let mut sources = vec![Source::WorkingCopy(checkout)];
+            sources.extend(released.iter().cloned().map(Source::Url));
+            optional.push(selected(sources, None, released));
         }
     }
 
@@ -821,18 +843,75 @@ mod tests {
     /// A name with a `..` component, which git refuses, names a directory
     /// outside the repository's metadata: the checkout skips it and removes
     /// nothing there.
+    fn git_ok(repo: &Utf8Path, args: &[&str]) {
+        // The identity is set here: a runner has no global one.
+        let mut command = git(repo);
+        command
+            .args(["-c", "protocol.file.allow=always"])
+            .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+            .args(args);
+        run(command, "git").unwrap();
+    }
+
+    /// A superproject with submodule `dep` checked out, whose `.gitmodules`
+    /// URL climbs above any remote, and a worktree of that commit.
+    fn unresolvable_url(dir: &Utf8Path) -> (Utf8PathBuf, Utf8PathBuf) {
+        let dep = dir.join("dep");
+        fs_err::create_dir_all(&dep).unwrap();
+        git_ok(&dep, &["init", "-q"]);
+        git_ok(&dep, &["commit", "-q", "--allow-empty", "-m", "dep"]);
+        let superproject = dir.join("super");
+        fs_err::create_dir_all(&superproject).unwrap();
+        git_ok(&superproject, &["init", "-q"]);
+        git_ok(
+            &superproject,
+            &["submodule", "add", "-q", dep.as_str(), "dep"],
+        );
+        let climbing = "../".repeat(64) + "dep";
+        git_ok(
+            &superproject,
+            &[
+                "config",
+                "-f",
+                ".gitmodules",
+                "submodule.dep.url",
+                &climbing,
+            ],
+        );
+        git_ok(&superproject, &["commit", "-qam", "release"]);
+        let release = dir.join("release");
+        git_ok(
+            &superproject,
+            &["worktree", "add", "-q", "--detach", release.as_str()],
+        );
+        (superproject, release)
+    }
+
+    /// A relative URL that does not resolve does not abort the release: the
+    /// working copy's checkout still has the submodule.
+    #[test]
+    fn a_required_submodule_with_an_unresolvable_url_comes_from_the_working_copy() {
+        let dir = crate::fs_utils::Utf8TempDir::new().unwrap();
+        let (superproject, release) = unresolvable_url(dir.path());
+
+        check_out(&release, &superproject, SubmoduleCheckout::Initialized).unwrap();
+        assert!(release.join("dep/.git").exists(), "dep not checked out");
+    }
+
+    /// An optional submodule whose relative URL does not resolve only warns,
+    /// as any other failure to fetch one does.
+    #[test]
+    fn an_optional_submodule_with_an_unresolvable_url_only_warns() {
+        let dir = crate::fs_utils::Utf8TempDir::new().unwrap();
+        let (superproject, release) = unresolvable_url(dir.path());
+        git_ok(&superproject, &["submodule", "deinit", "-q", "-f", "dep"]);
+
+        check_out(&release, &superproject, SubmoduleCheckout::All).unwrap();
+    }
+
     #[test]
     fn a_name_climbing_out_of_the_metadata_removes_nothing() {
         let dir = crate::fs_utils::Utf8TempDir::new().unwrap();
-        let git_ok = |repo: &Utf8Path, args: &[&str]| {
-            // The identity is set here: a runner has no global one.
-            let mut command = git(repo);
-            command
-                .args(["-c", "protocol.file.allow=always"])
-                .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
-                .args(args);
-            run(command, "git").unwrap();
-        };
         let victim = dir.path().join("victim");
         fs_err::create_dir_all(&victim).unwrap();
         fs_err::write(victim.join("keep"), "").unwrap();
