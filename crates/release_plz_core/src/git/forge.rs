@@ -1,6 +1,7 @@
 use crate::git::{gitea_client::Gitea, gitlab_client::GitLab, gitlab_graphql};
 use crate::{GitHub, GitReleaseInfo};
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use crate::pr::Pr;
 use crate::response_ext::ResponseExt;
@@ -37,6 +38,39 @@ impl GitForge {
             Self::Gitlab(_) => ForgeType::Gitlab,
         }
     }
+}
+
+/// Waits before each retry of a merge request whose just-pushed source
+/// branch GitLab does not know yet: about a minute in all, which covers its
+/// post-receive processing on a busy instance.
+const GITLAB_PUSHED_BRANCH_WAITS: [Duration; 6] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+];
+
+/// Whether a GitLab `400` merge request refusal says only that the source
+/// branch does not exist (`{"message":{"source_branch":["does not exist"]}}`).
+fn source_branch_pending(body: &str) -> bool {
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(message) = body.get("message").and_then(|m| m.as_object()) else {
+        return false;
+    };
+    message.len() == 1
+        && message
+            .get("source_branch")
+            .and_then(|errors| errors.as_array())
+            .is_some_and(|errors| {
+                !errors.is_empty()
+                    && errors
+                        .iter()
+                        .all(|error| error.as_str() == Some("does not exist"))
+            })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -541,6 +575,17 @@ impl GitClient {
 
     #[instrument(skip(self, pr))]
     pub async fn open_pr(&self, pr: &Pr) -> anyhow::Result<GitPr> {
+        self.open_pr_waiting_for_branch(pr, &GITLAB_PUSHED_BRANCH_WAITS)
+            .await
+    }
+
+    /// Open `pr`; on GitLab, while the just-pushed source branch is not yet
+    /// known to merge requests, retry after each of `waits`.
+    async fn open_pr_waiting_for_branch(
+        &self,
+        pr: &Pr,
+        waits: &[Duration],
+    ) -> anyhow::Result<GitPr> {
         debug!("Opening PR in {}", self.remote.owner_slash_repo());
 
         let json_body = match self.forge {
@@ -564,16 +609,44 @@ impl GitClient {
             }),
         };
 
-        let rep = self
-            .client
-            .post(self.pulls_url())
-            .json(&json_body)
-            .send()
-            .await
-            .context("failed when sending the response")?
-            .successful_status()
-            .await
-            .context("received unexpected response")?;
+        let mut waits = waits.iter();
+        let rep = loop {
+            let rep = self
+                .client
+                .post(self.pulls_url())
+                .json(&json_body)
+                .send()
+                .await
+                .context("failed when sending the response")?;
+            if self.forge == ForgeType::Gitlab
+                && rep.status() == StatusCode::BAD_REQUEST
+                && let Some(wait) = waits.next()
+            {
+                // GitLab registers a pushed branch for merge requests in its
+                // asynchronous post-receive processing; until then the branch
+                // is reported missing although the push succeeded.
+                let body = rep
+                    .text()
+                    .await
+                    .context("can't convert response body to text")?;
+                if source_branch_pending(&body) {
+                    debug!(
+                        "source branch {} not registered yet, retrying in {wait:?}",
+                        pr.branch
+                    );
+                    tokio::time::sleep(*wait).await;
+                    continue;
+                }
+                anyhow::bail!(
+                    "received unexpected response: HTTP status client error (400 Bad Request) for url ({})\nResponse body:\n{body}",
+                    self.pulls_url()
+                );
+            }
+            break rep
+                .successful_status()
+                .await
+                .context("received unexpected response")?;
+        };
 
         let git_pr: GitPr = match self.forge {
             ForgeType::Github | ForgeType::Gitea => {
@@ -1238,6 +1311,116 @@ mod tests {
                 .create_release(&release_info(generate_release_notes))
                 .await
                 .unwrap();
+        }
+    }
+
+    fn release_mr() -> Pr {
+        Pr {
+            base_branch: "main".to_string(),
+            branch: "release-plz/2026-10-18T09-23-06Z".to_string(),
+            title: "chore(release): v0.1.5".to_string(),
+            body: "body".to_string(),
+            draft: false,
+            labels: vec![],
+        }
+    }
+
+    fn gitlab_client(server: &wiremock::MockServer) -> GitClient {
+        let gitlab = GitLab {
+            remote: Remote {
+                owner: "group".to_string(),
+                repo: "repo".to_string(),
+                token: SecretString::from("token"),
+                base_url: format!("{}/api/v4/projects/group%2Frepo", server.uri())
+                    .parse()
+                    .unwrap(),
+            },
+        };
+        GitClient::new(GitForge::Gitlab(gitlab)).unwrap()
+    }
+
+    fn gitlab_mr_response() -> serde_json::Value {
+        json!({
+            "author": { "id": 1, "username": "bot" },
+            "iid": 7,
+            "web_url": "https://gitlab.example.com/group/repo/-/merge_requests/7",
+            "sha": "abc",
+            "source_branch": "release-plz/2026-10-18T09-23-06Z",
+            "title": "chore(release): v0.1.5",
+            "description": "body",
+            "labels": []
+        })
+    }
+
+    // GitLab registers a pushed branch for merge requests only after its
+    // post-receive processing, so a merge request created right after the
+    // push is refused with `source_branch: does not exist`. Opening the
+    // release MR waits for the branch instead of failing.
+    #[tokio::test]
+    async fn gitlab_mr_waits_for_a_just_pushed_branch() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/projects/group%2Frepo/merge_requests"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "message": { "source_branch": ["does not exist"] }
+            })))
+            .up_to_n_times(2)
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/projects/group%2Frepo/merge_requests"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(gitlab_mr_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = gitlab_client(&server);
+
+        let mr = client
+            .open_pr_waiting_for_branch(&release_mr(), &[Duration::ZERO; 3])
+            .await
+            .unwrap();
+
+        assert_eq!(mr.number, 7);
+    }
+
+    // A branch that does not appear within the waiting budget, and any other
+    // refusal, still fail with GitLab's response.
+    #[tokio::test]
+    async fn gitlab_mr_refusals_other_than_a_pending_branch_are_not_retried() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        for (body, attempts) in [
+            (
+                json!({ "message": { "source_branch": ["does not exist"] } }),
+                3,
+            ),
+            (
+                json!({ "message": ["Another open merge request already exists"] }),
+                1,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/v4/projects/group%2Frepo/merge_requests"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(body))
+                .expect(attempts)
+                .mount(&server)
+                .await;
+            let client = gitlab_client(&server);
+
+            let error = client
+                .open_pr_waiting_for_branch(&release_mr(), &[Duration::ZERO; 2])
+                .await
+                .unwrap_err();
+
+            assert!(format!("{error:#}").contains("400"), "{error:#}");
         }
     }
 
