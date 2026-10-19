@@ -91,6 +91,8 @@ the following sections:
   - [`git_tag_name`](#the-git_tag_name-field) — Customize git tag pattern.
   - [`git_release_generate_notes`](#the-git_release_generate_notes-field) — Generate release notes server-side.
   - [`git_only`](#the-git_only-field) — Use git tags instead of cargo registry.
+  - [`git_only_submodules`](#the-git_only_submodules-field) — Submodules of a release
+    reconstructed in git-only mode.
   - [`pr_branch_prefix`](#the-pr_branch_prefix-field) — Release PR branch prefix.
   - [`pr_draft`](#the-pr_draft-field) — Open the release Pull Request as a draft.
   - [`pr_name`](#the-pr_name-field) — Customize the name of the release Pull Request.
@@ -430,6 +432,35 @@ git_only = true
 ```
 
 This field can be overridden in the [`[package]`](#the-package-section) section.
+
+#### The `git_only_submodules` field
+
+In git-only mode, release-plz compares each package with its release by checking
+out the release commit in a temporary worktree. This field chooses which
+submodules are checked out there, at the commits the release records:
+
+- `"initialized"`: the submodules initialized in the working copy, at every level,
+  plus those the working copy no longer declares or now fetches from another URL.
+  Those are tried, and a failure to fetch one only warns. *(Default)*.
+- `"all"`: also the submodules the working copy leaves uninitialized, at every level,
+  tried the same way. Use it when a release needs a submodule the current sources no
+  longer use. Each comparison then fetches them.
+- `"none"`: no submodule; their directories stay empty.
+
+A submodule initialized in the working copy is fetched from that checkout first,
+then from its URL. A local path or `file://` URL follows git's own transport policy
+(`protocol.file.allow`).
+
+Example:
+
+```toml
+[workspace]
+git_only = true
+git_only_submodules = "all"
+```
+
+This field can only be set in the `[workspace]` section: packages released at the
+same commit share one reconstruction.
 
 #### The `pr_name` field
 
