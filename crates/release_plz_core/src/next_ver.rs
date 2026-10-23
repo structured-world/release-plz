@@ -111,15 +111,19 @@ impl ReconstructedWorkspace {
         })
     }
 
-    fn package(&self, package_name: &str) -> anyhow::Result<Package> {
-        cargo_utils::workspace_package(&self.released.metadata, package_name).cloned()
+    fn package(&self, package_name: &str) -> Option<&Package> {
+        let metadata = &self.released.metadata;
+        metadata.packages.iter().find(|package| {
+            package.name == package_name && metadata.workspace_members.contains(&package.id)
+        })
     }
 }
 
 /// Process a single `git_only` package: find its release tag and commit, reconstruct
 /// the workspace if it hasn't already been reconstructed, and return the package metadata.
 ///
-/// Returns `None` if no release tag is found (package will be treated as initial release).
+/// Returns `None` if no release tag is found or the package was not a workspace
+/// member at that tag (package will be treated as an initial release).
 #[instrument(skip_all, fields(package_name = %package.name))]
 fn process_git_only_package(
     package: &Package,
@@ -190,9 +194,17 @@ fn process_git_only_package(
 
     // Metadata paths point into the cached worktree. Any error aborts collection and drops
     // all reconstructed workspaces, so an unusable artifact cannot be reused.
-    let single_package = workspace.package(&package.name)?;
+    let Some(single_package) = workspace.package(&package.name) else {
+        // A shared tag can predate a newly added member. The reconstructed
+        // workspace is valid, but this package has no released baseline yet.
+        debug!(
+            "Package {} was not a workspace member at tag {release_tag}",
+            package.name
+        );
+        return Ok(None);
+    };
 
-    let registry_package = RegistryPackage::new(single_package, Some(release_commit))
+    let registry_package = RegistryPackage::new(single_package.clone(), Some(release_commit))
         .with_released_workspace(Arc::clone(&workspace.released));
     Ok(Some(registry_package))
 }

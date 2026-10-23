@@ -414,6 +414,9 @@ When `git_only` is enabled:
 - Version detection is based on git tags matching the
   [`git_tag_name`](#the-git_tag_name-field) pattern.
 - If no matching tag is found, the package is treated as an initial release.
+- A member absent from the workspace at a matching shared tag has no released baseline
+  and is treated as an initial release if enabled. Other members keep their baseline
+  from that tag.
 - Packages with `publish = false` in their `Cargo.toml` are also released (tagged), since
   they don't need a cargo registry.
 

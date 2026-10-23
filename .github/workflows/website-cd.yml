@@ -15,6 +15,7 @@ concurrency:
 jobs:
   deploy:
     name: Deploy website
+    if: github.repository == 'release-plz/release-plz'
     permissions:
       contents: write # Required for GitHub Pages deployment
     runs-on: ubuntu-latest

@@ -2,7 +2,336 @@ use cargo_metadata::camino::Utf8Path;
 use git_cmd::Repo;
 use release_plz_core::fs_utils::Utf8TempDir;
 
-use crate::helpers::{assert_locked_versions, cmd::release_plz_cmd, locked_metadata};
+use crate::helpers::{
+    assert_cargo_semver_checks_is_installed, assert_locked_versions, cmd::release_plz_cmd,
+    locked_metadata,
+};
+
+/// A shared release tag predates a new, excluded test helper. Its absence
+/// must not prevent the existing application from receiving its patch release.
+#[test]
+fn git_only_shared_tag_allows_a_new_excluded_member() {
+    let (temp_dir, repo) = workspace_with_new_git_only_member("");
+    let mut cmd = release_plz_cmd(&temp_dir.path().join("target"));
+    cmd.current_dir(repo.directory()).arg("update");
+    let output = cmd.assert().success();
+    let summary = String::from_utf8_lossy(&output.get_output().stdout);
+    assert_locked_versions(repo.directory(), &[("app", "1.0.1"), ("support", "1.0.1")]);
+    assert!(!summary.contains("`support`"), "{summary}");
+    assert!(!repo.directory().join("support/CHANGELOG.md").exists());
+}
+
+/// A newly released member also lacks a historical package despite the
+/// shared tag. It joins the version group without aborting reconstruction.
+#[test]
+fn git_only_shared_tag_allows_a_new_released_member() {
+    let (temp_dir, repo) = workspace_with_new_git_only_member(
+        "\n[[package]]\nname = \"support\"\nrelease = true\nversion_group = \"product\"\n",
+    );
+    let mut cmd = release_plz_cmd(&temp_dir.path().join("target"));
+    cmd.current_dir(repo.directory()).arg("update");
+    cmd.assert().success();
+    assert_locked_versions(repo.directory(), &[("app", "1.0.1"), ("support", "1.0.1")]);
+    let changelog = fs_err::read_to_string(repo.directory().join("support/CHANGELOG.md")).unwrap();
+    assert!(changelog.contains("## [1.0.1]"), "{changelog}");
+    assert!(changelog.contains("add local support"), "{changelog}");
+}
+
+/// Only a missing member is an initial release. Invalid historical workspace
+/// metadata must still abort the update rather than discard every baseline.
+#[test]
+fn git_only_shared_tag_rejects_an_invalid_historical_workspace() {
+    let (temp_dir, repo) = workspace_with_new_git_only_member("");
+    let manifest_path = repo.directory().join("Cargo.toml");
+    let mut manifest: toml_edit::DocumentMut = fs_err::read_to_string(&manifest_path)
+        .unwrap()
+        .parse()
+        .unwrap();
+    manifest["workspace"]["package"]["version"] = toml_edit::value("1.0.1");
+    let valid_manifest = manifest.to_string();
+    manifest["workspace"]["members"]
+        .as_array_mut()
+        .unwrap()
+        .push("missing");
+    fs_err::write(&manifest_path, manifest.to_string()).unwrap();
+    repo.add_all_and_commit("chore: record an invalid historical workspace")
+        .unwrap();
+    repo.tag_lightweight("v1.0.1").unwrap();
+    fs_err::write(&manifest_path, valid_manifest).unwrap();
+    generate_lockfile(repo.directory());
+    repo.add_all_and_commit("fix: repair the current workspace")
+        .unwrap();
+
+    let mut cmd = release_plz_cmd(&temp_dir.path().join("target"));
+    cmd.current_dir(repo.directory()).arg("update");
+    let output = cmd.assert().failure();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr).replace('\\', "/");
+    assert!(
+        stderr.contains("get cargo metadata for worktree"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("missing/Cargo.toml"), "{stderr}");
+}
+
+fn workspace_with_new_git_only_member(member_config: &str) -> (Utf8TempDir, Repo) {
+    let configuration = format!(
+        "[workspace]\ngit_only = true\npublish = false\nsemver_check = false\nrelease = false\ngit_tag_name = \"v{{{{ version }}}}\"\n\n[[package]]\nname = \"app\"\nrelease = true\nversion_group = \"product\"\n{member_config}"
+    );
+    let (temp_dir, repo) = init_workspace(
+        &[("app", "version.workspace = true\n")],
+        "\n[workspace.package]\nversion = \"1.0.0\"\n",
+        &configuration,
+    );
+    repo.git(&["remote", "add", "origin", "https://github.com/test/project"])
+        .unwrap();
+    repo.tag_lightweight("v1.0.0").unwrap();
+
+    let manifest_path = repo.directory().join("Cargo.toml");
+    let mut manifest: toml_edit::DocumentMut = fs_err::read_to_string(&manifest_path)
+        .unwrap()
+        .parse()
+        .unwrap();
+    manifest["workspace"]["members"]
+        .as_array_mut()
+        .unwrap()
+        .push("support");
+    fs_err::write(&manifest_path, manifest.to_string()).unwrap();
+    let support = repo.directory().join("support");
+    fs_err::create_dir_all(support.join("src")).unwrap();
+    fs_err::write(
+        support.join("Cargo.toml"),
+        "[package]\nname = \"support\"\nversion.workspace = true\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs_err::write(support.join("src/lib.rs"), "pub fn support() {}\n").unwrap();
+    let app_manifest = repo.directory().join("app/Cargo.toml");
+    let mut app: toml_edit::DocumentMut = fs_err::read_to_string(&app_manifest)
+        .unwrap()
+        .parse()
+        .unwrap();
+    app["dev-dependencies"]["support"]["path"] = toml_edit::value("../support");
+    fs_err::write(app_manifest, app.to_string()).unwrap();
+    generate_lockfile(repo.directory());
+    repo.add_all_and_commit("fix: add local support").unwrap();
+    (temp_dir, repo)
+}
+
+/// A tracked lockfile upgrade must retain its breaking-change marker even
+/// when an earlier source change already keeps the package in the release.
+#[test]
+fn a_tracked_lockfile_upgrade_keeps_its_breaking_change_marker() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let project = temp_dir.path().join("project");
+    let registry = temp_dir.path().join("registry");
+    for root in [&project, &registry] {
+        fs_err::create_dir_all(root.join("src")).unwrap();
+        fs_err::create_dir_all(root.join("vendor/helper/src")).unwrap();
+        fs_err::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\nedition = \"2024\"\nexclude = [\"vendor\"]\n\n[workspace]\nmembers = [\".\"]\nexclude = [\"vendor/helper\"]\n\n[dependencies]\nhelper = { version = \"1\", path = \"vendor/helper\" }\n",
+        )
+        .unwrap();
+        fs_err::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs_err::write(
+            root.join("vendor/helper/Cargo.toml"),
+            "[package]\nname = \"helper\"\nversion = \"1.0.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs_err::write(
+            root.join("vendor/helper/src/lib.rs"),
+            "pub fn helper() {}\n",
+        )
+        .unwrap();
+        generate_lockfile(root);
+    }
+    fs_err::write(
+        project.join("release-plz.toml"),
+        "[workspace]\nsemver_check = false\n",
+    )
+    .unwrap();
+    let repo = Repo::init(&project);
+    repo.git(&["remote", "add", "origin", "https://github.com/test/project"])
+        .unwrap();
+    repo.tag_lightweight("app-v1.0.0").unwrap();
+    fs_err::write(
+        project.join("src/main.rs"),
+        "fn main() { let _value = 1; }\n",
+    )
+    .unwrap();
+    repo.add_all_and_commit("fix: update application source")
+        .unwrap();
+    // The vendored dependency is excluded from the root package archive, so
+    // Cargo.lock is the only packaged file touched by this dependency upgrade.
+    fs_err::write(
+        project.join("vendor/helper/Cargo.toml"),
+        "[package]\nname = \"helper\"\nversion = \"1.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    generate_lockfile(&project);
+    repo.add_all_and_commit("feat!: upgrade locked helper")
+        .unwrap();
+
+    workspace_update_command(&temp_dir, &repo)
+        .assert()
+        .success();
+    assert_locked_versions(&project, &[("app", "2.0.0"), ("helper", "1.1.0")]);
+    let changelog = fs_err::read_to_string(project.join("CHANGELOG.md")).unwrap();
+    assert!(changelog.contains("upgrade locked helper"), "{changelog}");
+    assert!(
+        changelog.contains("update application source"),
+        "{changelog}"
+    );
+}
+
+/// A symlinked temporary directory must not make package-file filtering
+/// retain a clean merge and incorrectly apply its breaking-change marker.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_temporary_directory_does_not_release_a_clean_merge() {
+    let (temp_dir, repo) = workspace_with_clean_merge(|repo| {
+        // Keep Cargo's member lockfile resolvable to isolate path normalization.
+        fs_err::copy(
+            repo.directory().join("Cargo.lock"),
+            repo.directory().join("app/Cargo.lock"),
+        )
+        .unwrap();
+        repo.add_all_and_commit("chore: retain the package lockfile")
+            .unwrap();
+    });
+    let alias = temp_dir.path().join("alias");
+    fs_err::os::unix::fs::symlink(temp_dir.path(), &alias).unwrap();
+    let mut cmd = workspace_update_command(&temp_dir, &repo);
+    cmd.env("TMPDIR", &alias).env(
+        "RELEASE_PLZ_LOG",
+        "release_plz_core::command::update::updater=debug",
+    );
+    let output = cmd.assert().success();
+    let summary = String::from_utf8_lossy(&output.get_output().stdout);
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(
+        summary.contains("`app`: 1.0.0 -> 1.0.1"),
+        "{summary}\n{stderr}"
+    );
+    assert_locked_versions(repo.directory(), &[("app", "1.0.1")]);
+    let changelog = fs_err::read_to_string(repo.directory().join("app/CHANGELOG.md")).unwrap();
+    assert!(!changelog.contains("merge feature"), "{changelog}");
+}
+
+/// Cargo's virtual member lockfile is not an on-disk package file. Its
+/// absence must not retain a clean merge with a breaking-change marker.
+#[test]
+fn a_generated_member_lockfile_does_not_release_a_clean_merge() {
+    let (temp_dir, repo) = workspace_with_clean_merge(|_| {});
+    let canonical_temp = fs_err::canonicalize(temp_dir.path()).unwrap();
+    let mut cmd = workspace_update_command(&temp_dir, &repo);
+    cmd.env("TMPDIR", canonical_temp).env(
+        "RELEASE_PLZ_LOG",
+        "release_plz_core::command::update::updater=debug",
+    );
+    let output = cmd.assert().success();
+    let summary = String::from_utf8_lossy(&output.get_output().stdout);
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(
+        summary.contains("`app`: 1.0.0 -> 1.0.1"),
+        "{summary}\n{stderr}"
+    );
+    assert_locked_versions(repo.directory(), &[("app", "1.0.1")]);
+    let changelog = fs_err::read_to_string(repo.directory().join("app/CHANGELOG.md")).unwrap();
+    assert!(!changelog.contains("merge feature"), "{changelog}");
+}
+
+fn workspace_with_clean_merge(configure: impl FnOnce(&Repo)) -> (Utf8TempDir, Repo) {
+    let (temp_dir, repo) = released_workspace(
+        &[("app", "version = \"1.0.0\"\n")],
+        "",
+        "[workspace]\nsemver_check = false\n",
+    );
+    configure(&repo);
+    repo.checkout_new_branch("feature").unwrap();
+    change_package(&repo, "app", "fix: import a feature");
+    repo.checkout_head().unwrap();
+    fs_err::write(repo.directory().join("app/src/main.rs"), "fn main() {}\n").unwrap();
+    repo.add_all_and_commit("fix: add a binary").unwrap();
+    repo.git(&["merge", "--no-ff", "-m", "feat!: merge feature", "feature"])
+        .unwrap();
+    (temp_dir, repo)
+}
+
+#[test]
+fn semver_check_preserves_explicit_default_target_directory() {
+    for variable in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
+        let (_temp_dir, repo) = update_with_removed_function(|repo, cmd| {
+            cmd.env(variable, repo.directory().join("target"));
+        });
+
+        // Even when it matches Cargo's default, an explicit target directory
+        // must retain the rustdoc build artifacts for reuse on the next run.
+        assert!(
+            repo.directory().join("target/doc/one.json").exists(),
+            "{variable}"
+        );
+    }
+}
+
+#[test]
+fn semver_check_preserves_target_directory_from_cargo_config() {
+    let (_temp_dir, repo) = update_with_removed_function(|repo, _| {
+        let cargo_dir = repo.directory().join(".cargo");
+        fs_err::create_dir(&cargo_dir).unwrap();
+        fs_err::write(
+            cargo_dir.join("config.toml"),
+            "[build]\ntarget-dir = \"custom\"\n",
+        )
+        .unwrap();
+    });
+
+    // Unlike the target directory variables, `build.target-dir` is only visible in
+    // the cargo metadata, and it must retain the rustdoc build artifacts all the same.
+    assert!(repo.directory().join("custom/doc/one.json").exists());
+}
+
+#[test]
+fn semver_check_builds_in_a_temporary_target_directory_by_default() {
+    // Without a configured target directory, release-plz picks one per package.
+    let (temp_dir, _repo) = update_with_removed_function(|_, _| {});
+
+    // Without a temporary target directory, cargo-semver-checks would build the
+    // baseline in `registry/target`, the default target directory of its workspace.
+    assert!(!temp_dir.path().join("registry/target").exists());
+}
+
+/// Runs `release-plz update` with semver checks after a `fix:` commit to `one`,
+/// whose published version has a public function missing from the local one.
+/// The target directory variables are removed, so `configure` decides the target
+/// directory. It runs before the commit, as release-plz rejects uncommitted changes.
+fn update_with_removed_function(
+    configure: impl FnOnce(&Repo, &mut assert_cmd::Command),
+) -> (Utf8TempDir, Repo) {
+    assert_cargo_semver_checks_is_installed();
+    let (temp_dir, repo) = released_workspace(
+        &[("one", "version = \"1.0.0\"\n")],
+        "",
+        "[workspace]\nsemver_check = true\n",
+    );
+    fs_err::write(
+        temp_dir.path().join("registry/one/src/lib.rs"),
+        "pub fn removed() {}\n",
+    )
+    .unwrap();
+    let mut cmd = workspace_update_command(&temp_dir, &repo);
+    cmd.env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR");
+    configure(&repo, &mut cmd);
+    change_package(&repo, "one", "fix: update library");
+
+    cmd.assert().success();
+
+    // The current and the baseline version have the same name and version, so they
+    // write the same rustdoc JSON file in the shared target directory. The `fix`
+    // commit bumps the major version only if the removed function is still detected.
+    assert_locked_versions(repo.directory(), &[("one", "2.0.0")]);
+    (temp_dir, repo)
+}
 
 #[test]
 fn update_workspace_without_publishable_packages() {
@@ -230,6 +559,26 @@ fn update_lists_package_files_again_after_changes_in_skipped_commits() {
     );
 }
 
+#[test]
+fn update_lists_package_files_again_after_changes_beyond_the_first_batch() {
+    // The walk has more snapshots than the first `diff-tree` batch compares,
+    // and a commit in a later batch adds a Rust source. HEAD and the parent of
+    // that commit each ask Cargo, and every other snapshot reuses a list.
+    assert_package_file_listings_with_change(
+        "later batch",
+        |repo| {
+            for i in 0..20 {
+                if i == 10 {
+                    fs_err::write(repo.directory().join("one/src/extra.rs"), "").unwrap();
+                }
+                change_package(repo, "one", &format!("fix: change {i}"));
+            }
+        },
+        3,
+        21,
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn update_lists_package_files_when_checkout_hooks_change_files() {
@@ -278,8 +627,13 @@ fn update_lists_package_files_when_older_snapshots_track_a_checkout_hook() {
     // only when the walk starts would still reuse a stale list.
     fs_err::remove_file(&hook).unwrap();
     change_package(&repo, "one", "fix: second change");
+    // Neither HEAD nor the second change has the hook, so the second change
+    // reuses HEAD's list. The hook's removal makes the first change ask Cargo,
+    // and the release snapshot must check for the hook again rather than keep
+    // the answer for the newer checkouts.
+    change_package(&repo, "one", "fix: third change");
 
-    assert_package_file_listings(&temp_dir, &repo, "tracked hook", 4, 0);
+    assert_package_file_listings(&temp_dir, &repo, "tracked hook", 4, 1);
 }
 
 /// Install at `hook` an executable script that removes the untracked file
@@ -345,6 +699,53 @@ fn update_lists_package_files_with_a_symlinked_manifest() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn update_restores_the_lockfile_rewritten_by_cargo_before_1_87() {
+    let (temp_dir, repo) = single_package_workspace();
+    change_package(&repo, "one", "fix: first change");
+    // Cargo rewrites this hand-written lockfile when it resolves the workspace to
+    // package a lockfile. Left rewritten, it would stop the walk from checking
+    // out the first change, which has another lockfile.
+    fs_err::write(
+        repo.directory().join("Cargo.lock"),
+        "# Hand-written lockfile\nversion = 3\n[[package]]\nname = \"one\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+    change_package(&repo, "one", "fix: second change");
+    // Emulate a Cargo that predates `--exclude-lockfile` and rejects it.
+    let old_cargo = temp_dir.path().join("old-cargo");
+    fs_err::write(
+        &old_cargo,
+        r#"#!/bin/sh
+for arg do
+    if [ "$arg" = --exclude-lockfile ]; then
+        echo "error: unexpected argument '--exclude-lockfile' found" >&2
+        exit 1
+    fi
+done
+exec "$REAL_CARGO" "$@"
+"#,
+    )
+    .unwrap();
+    crate::helpers::make_executable(&old_cargo);
+
+    let output = workspace_update_command(&temp_dir, &repo)
+        .env("CARGO", &old_cargo)
+        .env("REAL_CARGO", env!("CARGO"))
+        .env("RELEASE_PLZ_LOG", "release_plz_core=debug")
+        .assert()
+        .success();
+
+    // Each listing falls back to packaging the lockfile.
+    let logs = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    assert!(
+        logs.contains("Run `cargo package --list --quiet --allow-dirty` in"),
+        "{logs}"
+    );
+    assert_patch_release(&repo, "old cargo", &["first change", "second change"]);
+}
+
 /// Run [`assert_package_file_listings`] on a [`single_package_workspace`]
 /// after the commits `fix: first change` and `fix: second change` to the Rust
 /// source of `one`. `change` runs before the second source change is committed.
@@ -367,8 +768,8 @@ fn assert_package_file_listings_with_change(
 /// Assert that updating the [`single_package_workspace`] of `repo` runs
 /// `cargo package --list` `cargo_runs` times, including once for the released
 /// source tree, and reuses a historical package file list `reuses` times, while
-/// the update still finds exactly the package changes `fix: first change` and
-/// `fix: second change`.
+/// the update still finds the package changes `fix: first change` and
+/// `fix: second change` but not the initial commit.
 fn assert_package_file_listings(
     temp_dir: &Utf8TempDir,
     repo: &Repo,

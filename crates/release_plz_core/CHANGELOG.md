@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.42.0](https://github.com/release-plz/release-plz/compare/release_plz_core-v0.41.1...release_plz_core-v0.42.0) - 2026-10-22
+
+### Other
+
+- *(repo_url)* [**breaking**] share host and port formatting ([#3263](https://github.com/release-plz/release-plz/pull/3263))
+- *(clone)* remove the unused git clone path ([#3256](https://github.com/release-plz/release-plz/pull/3256))
+- *(changelog)* replace ChangelogParser with a single helper ([#3262](https://github.com/release-plz/release-plz/pull/3262))
+- *(changelog)* deduplicate context and rendering helpers ([#3264](https://github.com/release-plz/release-plz/pull/3264))
+- share Cargo workspace and lockfile loading ([#3265](https://github.com/release-plz/release-plz/pull/3265))
+
+### Performance
+
+- list package files without resolving the lockfile ([#3247](https://github.com/release-plz/release-plz/pull/3247))
+
+## [0.41.1](https://github.com/release-plz/release-plz/compare/release_plz_core-v0.41.0...release_plz_core-v0.41.1) - 2026-10-21
+
+### Performance
+
+- speed up the temporary copies of the repository ([#3248](https://github.com/release-plz/release-plz/pull/3248))
+- query registry packages concurrently ([#3240](https://github.com/release-plz/release-plz/pull/3240))
+
+## [0.41.0](https://github.com/release-plz/release-plz/compare/release_plz_core-v0.40.0...release_plz_core-v0.41.0) - 2026-10-19
+
+### Performance
+
+- spawn fewer and cheaper git processes in history walks ([#3250](https://github.com/release-plz/release-plz/pull/3250))
+- don't query the registry again after cargo publish confirms the package ([#3251](https://github.com/release-plz/release-plz/pull/3251))
+- reuse dependency builds between current and baseline semver checks ([#3243](https://github.com/release-plz/release-plz/pull/3243))
+- list open PRs while release-pr analyzes the packages ([#3249](https://github.com/release-plz/release-plz/pull/3249))
+- read downloaded registry packages in parallel ([#3246](https://github.com/release-plz/release-plz/pull/3246))
+
 ## [0.40.0](https://github.com/release-plz/release-plz/compare/release_plz_core-v0.39.0...release_plz_core-v0.40.0) - 2026-10-12
 
 ### Performance
