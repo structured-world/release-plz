@@ -29,7 +29,7 @@ use crate::{
     diff::{Commit, Diff},
     fs_utils, lock_compare,
     next_ver::takes_part_in_release,
-    package_compare::{PackageFiles, is_generated_package_file},
+    package_compare::{CARGO_TOML_ORIG, CARGO_VCS_INFO, PackageFiles},
     registry_packages::{PackagesCollection, RegistryPackage},
     semver_check::{self, SemverCheck},
     toml_compare,
@@ -1050,22 +1050,33 @@ fn get_package_files(
     // files with the git output.
     let repository_dir = fs_utils::canonicalize_utf8(repository.directory())?;
 
-    package_files
-        .get(package_path)?
-        .iter()
-        // Generated archive entries, including a workspace member's virtual
-        // Cargo.lock, need not exist in the source tree.
-        .filter(|file| !is_generated_package_file(file.as_str()))
-        .map(|file| {
-            // Normalize path to handle symbolic links correctly.
-            let file_path = package_path.join(file);
-            let normalized = fs_utils::canonicalize_utf8(&file_path)?;
-            let relative_path = normalized
-                .strip_prefix(&repository_dir)
-                .with_context(|| format!("failed to strip {repository_dir} from {normalized}"))?;
-            Ok(relative_path.to_path_buf())
-        })
-        .collect()
+    let package_files = package_files.get(package_path)?;
+    let mut files = HashSet::with_capacity(package_files.len());
+    for file in package_files {
+        if matches!(file.as_str(), CARGO_TOML_ORIG | CARGO_VCS_INFO) {
+            continue;
+        }
+        let file_path = package_path.join(file);
+        let normalized = match fs_utils::canonicalize_utf8(&file_path) {
+            Ok(path) => path,
+            // Cargo lists virtual lockfiles for workspace members, but a real
+            // tracked lockfile must still contribute its commit messages.
+            Err(error)
+                if file == "Cargo.lock"
+                    && error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let relative_path = normalized
+            .strip_prefix(&repository_dir)
+            .with_context(|| format!("failed to strip {repository_dir} from {normalized}"))?;
+        files.insert(relative_path.to_path_buf());
+    }
+    Ok(files)
 }
 
 /// The paths whose history holds a package's changes.

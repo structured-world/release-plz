@@ -371,7 +371,7 @@ impl Repo {
         exclude: &[&str],
         paths: &[impl AsRef<Utf8Path>],
     ) -> anyhow::Result<Vec<String>> {
-        let output = self.rev_list(&["--full-history", commit], exclude, paths)?;
+        let output = self.rev_list(commit, &["--full-history"], exclude, paths)?;
         let output = cmd::string_from_bytes(output)?;
         Ok(output.lines().map(str::to_owned).collect())
     }
@@ -382,7 +382,7 @@ impl Repo {
     /// `exclude` commits and their ancestors are dropped. An `exclude` entry that
     /// doesn't exist in this repository is ignored, so a commit hash recorded by a
     /// release that happened in another repository, or missing from a shallow clone,
-    /// is not fatal.
+    /// is not fatal. An unresolved `head` is an error.
     ///
     /// Commits are ordered by date rather than topologically: `--topo-order` emits
     /// whole lineages contiguously, so combining it with `max_commits` would keep the
@@ -404,9 +404,9 @@ impl Repo {
         // Listing the messages here saves a `git log` for each commit a walk
         // keeps. Git prints each commit as `commit <id> <parents>\n<format>\n`.
         // Messages can't contain NUL, so a NUL ends each one unambiguously.
-        let mut args = vec!["--parents", "--date-order", "--format=%B%x00", head];
+        let mut args = vec!["--parents", "--date-order", "--format=%B%x00"];
         args.extend(limit.as_deref());
-        let output = self.rev_list(&args, exclude, paths)?;
+        let output = self.rev_list(head, &args, exclude, paths)?;
         output
             .split(|byte| *byte == b'\0')
             .map(|entry| entry.strip_prefix(b"\n").unwrap_or(entry))
@@ -419,15 +419,26 @@ impl Repo {
     /// and return its raw output.
     fn rev_list(
         &self,
+        head: &str,
         args: &[&str],
         exclude: &[&str],
         paths: &[impl AsRef<Utf8Path>],
     ) -> anyhow::Result<Vec<u8>> {
+        // --ignore-missing also drops a missing positive revision. Resolve the
+        // tip first so an invalid walk cannot look like an empty history.
+        let head = self
+            .git(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &format!("{head}^{{commit}}"),
+            ])
+            .with_context(|| format!("failed to resolve commit `{head}`"))?;
         let exclusions: Vec<String> = exclude.iter().map(|commit| format!("^{commit}")).collect();
-        // Drop the exclusions that don't exist in this repository. A missing
-        // tip would be dropped too, listing no commits.
         let mut rev_list = vec!["rev-list", "--ignore-missing"];
         rev_list.extend(args);
+        rev_list.push(head.as_str());
         rev_list.extend(exclusions.iter().map(String::as_str));
         rev_list.push("--");
         rev_list.extend(paths.iter().map(|p| p.as_ref().as_str()));

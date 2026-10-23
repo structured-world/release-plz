@@ -116,6 +116,73 @@ fn workspace_with_new_git_only_member(member_config: &str) -> (Utf8TempDir, Repo
     (temp_dir, repo)
 }
 
+/// A tracked lockfile upgrade must retain its breaking-change marker even
+/// when an earlier source change already keeps the package in the release.
+#[test]
+fn a_tracked_lockfile_upgrade_keeps_its_breaking_change_marker() {
+    let temp_dir = Utf8TempDir::new().unwrap();
+    let project = temp_dir.path().join("project");
+    let registry = temp_dir.path().join("registry");
+    for root in [&project, &registry] {
+        fs_err::create_dir_all(root.join("src")).unwrap();
+        fs_err::create_dir_all(root.join("vendor/helper/src")).unwrap();
+        fs_err::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\nedition = \"2024\"\nexclude = [\"vendor\"]\n\n[workspace]\nmembers = [\".\"]\nexclude = [\"vendor/helper\"]\n\n[dependencies]\nhelper = { version = \"1\", path = \"vendor/helper\" }\n",
+        )
+        .unwrap();
+        fs_err::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs_err::write(
+            root.join("vendor/helper/Cargo.toml"),
+            "[package]\nname = \"helper\"\nversion = \"1.0.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs_err::write(
+            root.join("vendor/helper/src/lib.rs"),
+            "pub fn helper() {}\n",
+        )
+        .unwrap();
+        generate_lockfile(root);
+    }
+    fs_err::write(
+        project.join("release-plz.toml"),
+        "[workspace]\nsemver_check = false\n",
+    )
+    .unwrap();
+    let repo = Repo::init(&project);
+    repo.git(&["remote", "add", "origin", "https://github.com/test/project"])
+        .unwrap();
+    repo.tag_lightweight("app-v1.0.0").unwrap();
+    fs_err::write(
+        project.join("src/main.rs"),
+        "fn main() { let _value = 1; }\n",
+    )
+    .unwrap();
+    repo.add_all_and_commit("fix: update application source")
+        .unwrap();
+    // The vendored dependency is excluded from the root package archive, so
+    // Cargo.lock is the only packaged file touched by this dependency upgrade.
+    fs_err::write(
+        project.join("vendor/helper/Cargo.toml"),
+        "[package]\nname = \"helper\"\nversion = \"1.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    generate_lockfile(&project);
+    repo.add_all_and_commit("feat!: upgrade locked helper")
+        .unwrap();
+
+    workspace_update_command(&temp_dir, &repo)
+        .assert()
+        .success();
+    assert_locked_versions(&project, &[("app", "2.0.0"), ("helper", "1.1.0")]);
+    let changelog = fs_err::read_to_string(project.join("CHANGELOG.md")).unwrap();
+    assert!(changelog.contains("upgrade locked helper"), "{changelog}");
+    assert!(
+        changelog.contains("update application source"),
+        "{changelog}"
+    );
+}
+
 /// A symlinked temporary directory must not make package-file filtering
 /// retain a clean merge and incorrectly apply its breaking-change marker.
 #[cfg(unix)]

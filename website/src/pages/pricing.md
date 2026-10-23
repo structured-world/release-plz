@@ -22,9 +22,9 @@ Here’s how you can help:
 If you are using Release-plz at your organization to improve your engineering team's productivity,
 please reflect on the hours Release-plz saves your team every month
 and consider
-investing a portion of these savings to [sponsor](https://github.com/sponsors/release-plz) the author.
+investing a portion of these savings to [sponsor Release-plz](https://github.com/sponsors/release-plz).
 
-By sponsoring, you're enabling the author to focus more on the development of Release-plz, ensuring
+By sponsoring, you're enabling the maintainers to focus more on the development of Release-plz, ensuring
 it remains sustainable, up-to-date and secure.
 
 ## 📬 Stay Updated
