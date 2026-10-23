@@ -669,8 +669,8 @@ impl GitClient {
     /// within the input and against existing PR labels.
     /// # Returns
     /// A tuple containing:
-    /// - Vec<String>: Labels that need to be created in the repository
-    /// - Vec<u64>: IDs of existing labels to be added to the PR (excluding duplicates and ones already present)
+    /// - `Vec<String>`: Labels that need to be created in the repository
+    /// - `Vec<u64>`: IDs of existing labels to be added to the PR (excluding duplicates and ones already present)
     async fn get_labels_info_and_categorize_labels(
         &self,
         labels: &[String],
