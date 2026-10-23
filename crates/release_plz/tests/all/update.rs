@@ -7,6 +7,189 @@ use crate::helpers::{
     locked_metadata,
 };
 
+/// A shared release tag predates a new, excluded test helper. Its absence
+/// must not prevent the existing application from receiving its patch release.
+#[test]
+fn git_only_shared_tag_allows_a_new_excluded_member() {
+    let (temp_dir, repo) = workspace_with_new_git_only_member("");
+    let mut cmd = release_plz_cmd(&temp_dir.path().join("target"));
+    cmd.current_dir(repo.directory()).arg("update");
+    let output = cmd.assert().success();
+    let summary = String::from_utf8_lossy(&output.get_output().stdout);
+    assert_locked_versions(repo.directory(), &[("app", "1.0.1"), ("support", "1.0.1")]);
+    assert!(!summary.contains("`support`"), "{summary}");
+    assert!(!repo.directory().join("support/CHANGELOG.md").exists());
+}
+
+/// A newly released member also lacks a historical package despite the
+/// shared tag. It joins the version group without aborting reconstruction.
+#[test]
+fn git_only_shared_tag_allows_a_new_released_member() {
+    let (temp_dir, repo) = workspace_with_new_git_only_member(
+        "\n[[package]]\nname = \"support\"\nrelease = true\nversion_group = \"product\"\n",
+    );
+    let mut cmd = release_plz_cmd(&temp_dir.path().join("target"));
+    cmd.current_dir(repo.directory()).arg("update");
+    cmd.assert().success();
+    assert_locked_versions(repo.directory(), &[("app", "1.0.1"), ("support", "1.0.1")]);
+    let changelog = fs_err::read_to_string(repo.directory().join("support/CHANGELOG.md")).unwrap();
+    assert!(changelog.contains("## [1.0.1]"), "{changelog}");
+    assert!(changelog.contains("add local support"), "{changelog}");
+}
+
+/// Only a missing member is an initial release. Invalid historical workspace
+/// metadata must still abort the update rather than discard every baseline.
+#[test]
+fn git_only_shared_tag_rejects_an_invalid_historical_workspace() {
+    let (temp_dir, repo) = workspace_with_new_git_only_member("");
+    let manifest_path = repo.directory().join("Cargo.toml");
+    let mut manifest: toml_edit::DocumentMut = fs_err::read_to_string(&manifest_path)
+        .unwrap()
+        .parse()
+        .unwrap();
+    manifest["workspace"]["package"]["version"] = toml_edit::value("1.0.1");
+    let valid_manifest = manifest.to_string();
+    manifest["workspace"]["members"]
+        .as_array_mut()
+        .unwrap()
+        .push("missing");
+    fs_err::write(&manifest_path, manifest.to_string()).unwrap();
+    repo.add_all_and_commit("chore: record an invalid historical workspace")
+        .unwrap();
+    repo.tag_lightweight("v1.0.1").unwrap();
+    fs_err::write(&manifest_path, valid_manifest).unwrap();
+    generate_lockfile(repo.directory());
+    repo.add_all_and_commit("fix: repair the current workspace")
+        .unwrap();
+
+    let mut cmd = release_plz_cmd(&temp_dir.path().join("target"));
+    cmd.current_dir(repo.directory()).arg("update");
+    let output = cmd.assert().failure();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr).replace('\\', "/");
+    assert!(
+        stderr.contains("get cargo metadata for worktree"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("missing/Cargo.toml"), "{stderr}");
+}
+
+fn workspace_with_new_git_only_member(member_config: &str) -> (Utf8TempDir, Repo) {
+    let configuration = format!(
+        "[workspace]\ngit_only = true\npublish = false\nsemver_check = false\nrelease = false\ngit_tag_name = \"v{{{{ version }}}}\"\n\n[[package]]\nname = \"app\"\nrelease = true\nversion_group = \"product\"\n{member_config}"
+    );
+    let (temp_dir, repo) = init_workspace(
+        &[("app", "version.workspace = true\n")],
+        "\n[workspace.package]\nversion = \"1.0.0\"\n",
+        &configuration,
+    );
+    repo.git(&["remote", "add", "origin", "https://github.com/test/project"])
+        .unwrap();
+    repo.tag_lightweight("v1.0.0").unwrap();
+
+    let manifest_path = repo.directory().join("Cargo.toml");
+    let mut manifest: toml_edit::DocumentMut = fs_err::read_to_string(&manifest_path)
+        .unwrap()
+        .parse()
+        .unwrap();
+    manifest["workspace"]["members"]
+        .as_array_mut()
+        .unwrap()
+        .push("support");
+    fs_err::write(&manifest_path, manifest.to_string()).unwrap();
+    let support = repo.directory().join("support");
+    fs_err::create_dir_all(support.join("src")).unwrap();
+    fs_err::write(
+        support.join("Cargo.toml"),
+        "[package]\nname = \"support\"\nversion.workspace = true\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs_err::write(support.join("src/lib.rs"), "pub fn support() {}\n").unwrap();
+    let app_manifest = repo.directory().join("app/Cargo.toml");
+    let mut app: toml_edit::DocumentMut = fs_err::read_to_string(&app_manifest)
+        .unwrap()
+        .parse()
+        .unwrap();
+    app["dev-dependencies"]["support"]["path"] = toml_edit::value("../support");
+    fs_err::write(app_manifest, app.to_string()).unwrap();
+    generate_lockfile(repo.directory());
+    repo.add_all_and_commit("fix: add local support").unwrap();
+    (temp_dir, repo)
+}
+
+/// A symlinked temporary directory must not make package-file filtering
+/// retain a clean merge and incorrectly apply its breaking-change marker.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_temporary_directory_does_not_release_a_clean_merge() {
+    let (temp_dir, repo) = workspace_with_clean_merge(|repo| {
+        // Keep Cargo's member lockfile resolvable to isolate path normalization.
+        fs_err::copy(
+            repo.directory().join("Cargo.lock"),
+            repo.directory().join("app/Cargo.lock"),
+        )
+        .unwrap();
+        repo.add_all_and_commit("chore: retain the package lockfile")
+            .unwrap();
+    });
+    let alias = temp_dir.path().join("alias");
+    fs_err::os::unix::fs::symlink(temp_dir.path(), &alias).unwrap();
+    let mut cmd = workspace_update_command(&temp_dir, &repo);
+    cmd.env("TMPDIR", &alias).env(
+        "RELEASE_PLZ_LOG",
+        "release_plz_core::command::update::updater=debug",
+    );
+    let output = cmd.assert().success();
+    let summary = String::from_utf8_lossy(&output.get_output().stdout);
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(
+        summary.contains("`app`: 1.0.0 -> 1.0.1"),
+        "{summary}\n{stderr}"
+    );
+    assert_locked_versions(repo.directory(), &[("app", "1.0.1")]);
+    let changelog = fs_err::read_to_string(repo.directory().join("app/CHANGELOG.md")).unwrap();
+    assert!(!changelog.contains("merge feature"), "{changelog}");
+}
+
+/// Cargo's virtual member lockfile is not an on-disk package file. Its
+/// absence must not retain a clean merge with a breaking-change marker.
+#[test]
+fn a_generated_member_lockfile_does_not_release_a_clean_merge() {
+    let (temp_dir, repo) = workspace_with_clean_merge(|_| {});
+    let canonical_temp = fs_err::canonicalize(temp_dir.path()).unwrap();
+    let mut cmd = workspace_update_command(&temp_dir, &repo);
+    cmd.env("TMPDIR", canonical_temp).env(
+        "RELEASE_PLZ_LOG",
+        "release_plz_core::command::update::updater=debug",
+    );
+    let output = cmd.assert().success();
+    let summary = String::from_utf8_lossy(&output.get_output().stdout);
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(
+        summary.contains("`app`: 1.0.0 -> 1.0.1"),
+        "{summary}\n{stderr}"
+    );
+    assert_locked_versions(repo.directory(), &[("app", "1.0.1")]);
+    let changelog = fs_err::read_to_string(repo.directory().join("app/CHANGELOG.md")).unwrap();
+    assert!(!changelog.contains("merge feature"), "{changelog}");
+}
+
+fn workspace_with_clean_merge(configure: impl FnOnce(&Repo)) -> (Utf8TempDir, Repo) {
+    let (temp_dir, repo) = released_workspace(
+        &[("app", "version = \"1.0.0\"\n")],
+        "",
+        "[workspace]\nsemver_check = false\n",
+    );
+    configure(&repo);
+    repo.checkout_new_branch("feature").unwrap();
+    change_package(&repo, "app", "fix: import a feature");
+    repo.checkout_head().unwrap();
+    fs_err::write(repo.directory().join("app/src/main.rs"), "fn main() {}\n").unwrap();
+    repo.add_all_and_commit("fix: add a binary").unwrap();
+    repo.git(&["merge", "--no-ff", "-m", "feat!: merge feature", "feature"])
+        .unwrap();
+    (temp_dir, repo)
+}
+
 #[test]
 fn semver_check_preserves_explicit_default_target_directory() {
     for variable in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
